@@ -17,7 +17,7 @@ Endpoints
 import math
 from flask import Blueprint, request, jsonify
 
-from modules.fuzzy_search import get_engine, apply_synonyms
+from modules.fuzzy_search import get_engine, apply_synonyms, get_query_suggestion
 from modules.autocomplete import get_suggestions
 from modules.analytics import log_search, get_recent_searches, get_top_queries
 from modules.cache import search_cache
@@ -135,6 +135,21 @@ def api_search():
     end           = start + limit
     page_results  = all_results[start:end]
 
+    # ── "Did You Mean" suggestion ─────────────────────────────────────────────
+    # Build a choices pool from the top result names (real product vocabulary)
+    # plus the static keyword list inside get_query_suggestion().
+    # We cap at 200 names so this stays fast — the top results are the most
+    # relevant candidates anyway.
+    top_names = [r["name"] for r in all_results[:200] if r.get("name")]
+    # Pass the best result's score so the function can decide whether results
+    # are already strong enough (≥ 70) to skip the suggestion entirely.
+    top_score = all_results[0]["score"] if all_results else 0.0
+    suggestion = get_query_suggestion(
+        query,
+        choices=top_names,
+        top_result_score=top_score,
+    )
+
     # ── Log to analytics (async-safe: just a DB insert) ───────────────────────
     log_search(query, total_results)
 
@@ -149,6 +164,9 @@ def api_search():
         "sort":           sort,
         "filters":        active_filters,
         "results":        page_results,
+        # suggestion is None when the query is already a strong match (score ≥ 70)
+        # or too distant from anything known (score < 35).
+        "suggestion":     suggestion,
     }
 
     # Cache the response

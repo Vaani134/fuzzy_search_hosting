@@ -232,6 +232,168 @@ def blend_score(query: str, normalized_text: str, raw_text: str) -> float:
     return max(score_n, score_r)
 
 
+# ── "Did You Mean" suggestion ─────────────────────────────────────────────────
+
+# Static keyword vocabulary — common product-type terms users frequently
+# misspell. Merged into every suggestion pool automatically.
+# Safe to extend; has no effect on search scoring.
+_SUGGESTION_KEYWORDS: List[str] = [
+    "hookah", "grinder", "cigarette", "tobacco", "charcoal", "lighter",
+    "pipe", "vape", "e-cigarette", "energy drink", "blunt wrap", "cigar",
+    "rolling paper", "filter", "ashtray", "bong", "bubbler", "dab rig",
+    "glass pipe", "water pipe", "herb grinder", "rolling machine",
+]
+
+# Maximum number of candidates passed to extractOne.
+# Keeps the function fast even when the caller supplies thousands of names.
+_SUGGESTION_POOL_LIMIT = 500
+
+
+def get_query_suggestion(
+    query: str,
+    choices: Optional[List[str]] = None,
+    top_result_score: Optional[float] = None,   # kept for API compatibility; unused
+) -> Optional[str]:
+    """
+    Return a "Did You Mean" spelling correction for *query*, or ``None``.
+
+    Design goals
+    ------------
+    • Suggest when helpful  — obvious typos like "grdiner" → "grinder"
+    • Stay silent otherwise — correct queries, gibberish, or empty input
+    • Independent of search results — does not rely on top_result_score
+      (that parameter is accepted for backwards-compatibility but ignored)
+
+    Candidate pool (three sources, merged and deduplicated)
+    -------------------------------------------------------
+    1. ``choices``          — caller-supplied strings (top product names,
+                              category names, etc.)
+    2. ``SYNONYMS`` keys    — known misspelling variants ("hooka", "grider"…)
+    3. ``SYNONYMS`` values  — canonical forms ("hookah", "grinder"…)
+    4. ``_SUGGESTION_KEYWORDS`` — curated product-type vocabulary
+
+    Combining synonym keys AND values is important: a user typing "grdiner"
+    needs to match against "grinder" (a value), while a user typing "hooka"
+    needs to match against "hookah" (also a value, since "hooka" → "hookah").
+
+    Threshold logic  (score = WRatio on normalized strings)
+    --------------------------------------------------------
+    score < 50   → too distant — no reliable correction exists → None
+    50 ≤ score < 100 → plausible typo — return the best candidate
+    score = 100  → identical after normalization — nothing to correct → None
+
+    Why 100 instead of 90 as the upper bound?
+    ------------------------------------------
+    "hooka" scores 90.9 against "hookah" — that IS a typo that needs
+    correcting.  Cutting off at 90 would suppress it.  The only case where
+    we must return None is when the normalized query IS the candidate
+    (score = 100), which the identity check below handles explicitly.
+
+    Parameters
+    ----------
+    query            : str
+        Raw user input, any casing.
+    choices          : list of str, optional
+        Extra candidates (e.g. top product names from the search results).
+        Merged with synonym vocabulary and keyword list.
+    top_result_score : float, optional
+        Accepted for API compatibility with the route layer; not used.
+
+    Returns
+    -------
+    str or None
+        The best-matching candidate string, or None.
+
+    Examples
+    --------
+    >>> get_query_suggestion("grdiner")
+    'grinder'
+    >>> get_query_suggestion("hooka")
+    'hookah'
+    >>> get_query_suggestion("hookah")
+    None
+    >>> get_query_suggestion("asdlkj123")
+    None
+    """
+    if not RAPIDFUZZ_AVAILABLE:
+        return None
+
+    # ── Step 1: normalize the query ───────────────────────────────────────────
+    # Use the same normalize() the search engine uses so comparisons are
+    # apples-to-apples (lowercase, no prices/brackets/special chars).
+    query_n = normalize(query.strip())
+    if not query_n:
+        return None
+
+    # ── Step 2: build the candidate pool ─────────────────────────────────────
+    # Sources (in priority order for deduplication):
+    #   a) caller-supplied choices  (real product names — highest signal)
+    #   b) SYNONYMS values          (canonical forms: "hookah", "grinder"…)
+    #   c) static keyword list      (curated fallback vocabulary)
+    #
+    # IMPORTANT: synonym KEYS are intentionally excluded from the pool.
+    # Keys are known misspellings ("hooka", "grider", "sheesha"…).
+    # If a key were in the pool, the query "hooka" would score 100 against
+    # itself, trigger the identity check, and return None — the opposite of
+    # what we want.  Only canonical values belong here as valid suggestions.
+    #
+    # dict.fromkeys() deduplicates while preserving insertion order so that
+    # higher-priority sources win when two entries normalize to the same string.
+    raw_pool: List[str] = list(dict.fromkeys(
+        [c for c in (choices or []) if isinstance(c, str) and c.strip()]
+        + [v for v in SYNONYMS.values() if isinstance(v, str) and v.strip()]
+        + _SUGGESTION_KEYWORDS
+    ))
+
+    # Cap pool size for performance — keep the first N entries (caller-supplied
+    # choices are first, so the most relevant candidates are always included).
+    pool = raw_pool[:_SUGGESTION_POOL_LIMIT]
+    if not pool:
+        return None
+
+    # ── Step 3: normalize every candidate ────────────────────────────────────
+    # Pre-normalize so extractOne compares clean strings on both sides.
+    normalized_pool: List[str] = [normalize(c) for c in pool]
+
+    # ── Step 4: find the best match ───────────────────────────────────────────
+    # WRatio handles character transpositions, insertions, and deletions —
+    # exactly the errors users make when typing product names.
+    result = process.extractOne(
+        query_n,
+        normalized_pool,
+        scorer=fuzz.WRatio,
+    )
+    if result is None:
+        return None
+
+    _matched_text, match_score, idx = result
+
+    # ── Step 5: apply threshold gates ────────────────────────────────────────
+    #
+    # Gate A — lower bound (score < 60):
+    #   The best candidate is too distant from the query.  Suggesting it
+    #   would be misleading.  60 is chosen because:
+    #     • Real typos ("grdiner"→"grinder") score 85+
+    #     • Gibberish ("asdlkj123"→"wraps") scores ~51 — safely below 60
+    #     • The gap between real typos and noise is wide enough that 60
+    #       cleanly separates them without suppressing valid corrections.
+    if match_score < 60:
+        return None
+
+    # Gate B — identity check (normalized match == normalized query):
+    #   The query already IS the canonical form — nothing to correct.
+    #   This catches "hookah" → "hookah" (score 100) without needing a
+    #   hard upper-bound cutoff that would suppress real typos like
+    #   "hooka" → "hookah" (score 90.9).
+    if normalized_pool[idx] == query_n:
+        return None
+
+    # ── Step 6: return the original (un-normalized) candidate ────────────────
+    # Return pool[idx] rather than the normalized form so the UI receives
+    # proper casing — e.g. "Grinder" if that's what was in the choices list.
+    return pool[idx]
+
+
 def apply_boost(base_score: float, query_n: str, product_name_n: str) -> float:
     """
     Apply deterministic boosting rules on top of the blend score.
