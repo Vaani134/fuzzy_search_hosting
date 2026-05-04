@@ -161,6 +161,8 @@ CREATE TABLE IF NOT EXISTS sync_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     table_name  TEXT    NOT NULL,
     last_synced TEXT    DEFAULT NULL,
+    .+
+    +
     records_synced INTEGER DEFAULT 0,
     status      TEXT    DEFAULT 'pending',
     error_msg   TEXT    DEFAULT NULL,

@@ -37,7 +37,9 @@ SYNC_TABLES = [
 ]
 
 # How many rows to fetch per batch during sync
-SYNC_BATCH_SIZE = 500
+# 2000 rows per batch = ~244 round trips for 488k transaction_sell_lines rows
+# (vs 976 round trips at 500). Fewer connections = less chance of timeout.
+SYNC_BATCH_SIZE = 2000
 
 # ── Search settings ────────────────────────────────────────────────────────────
 SEARCH_MIN_SCORE  = 35.0   # discard results below this score
