@@ -158,13 +158,22 @@ CREATE INDEX IF NOT EXISTS idx_tsl_product     ON transaction_sell_lines(product
 
 -- ─── sync_log (tracks MySQL → SQLite sync state) ─────────────────────────────
 CREATE TABLE IF NOT EXISTS sync_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    table_name  TEXT    NOT NULL,
-    last_synced TEXT    DEFAULT NULL,
-    .+
-    +
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_name     TEXT    NOT NULL,
+    last_synced    TEXT    DEFAULT NULL,
     records_synced INTEGER DEFAULT 0,
-    status      TEXT    DEFAULT 'pending',
-    error_msg   TEXT    DEFAULT NULL,
-    created_at  TEXT    DEFAULT CURRENT_TIMESTAMP
+    status         TEXT    DEFAULT 'pending',
+    error_msg      TEXT    DEFAULT NULL,
+    created_at     TEXT    DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ─── search_history (analytics: every search query logged) ───────────────────
+CREATE TABLE IF NOT EXISTS search_history (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    query        TEXT    NOT NULL,
+    result_count INTEGER NOT NULL DEFAULT 0,
+    timestamp    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_history_query     ON search_history(query);
+CREATE INDEX IF NOT EXISTS idx_search_history_timestamp ON search_history(timestamp);

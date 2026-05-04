@@ -6,13 +6,31 @@ Flask application — entry point.
 Routes
 ------
   GET  /                        — dashboard
-  GET  /search                  — search UI
-  GET  /api/search?q=&k=        — JSON search API
+  GET  /search                  — search UI (with pagination, filters, sort)
+  GET  /product/<id>            — product detail page
+  GET  /sync                    — sync management page
+  GET  /settings                — database settings page
+
+  -- Search API (registered via Blueprint in routes/search_routes.py) --
+  GET  /api/search              — paginated, filtered, sorted fuzzy search
+  GET  /api/search/history      — recent search queries
+  GET  /api/search/top          — most-frequent queries
+  POST /api/search/rebuild      — rebuild in-memory index
+  GET  /api/autocomplete        — autocomplete suggestions
+  GET  /api/cache/stats         — cache statistics
+  POST /api/cache/clear         — clear search cache
+
+  -- Other API --
   GET  /api/product/<id>        — product detail JSON
   POST /api/sync                — trigger MySQL → SQLite sync
-  GET  /api/sync/status         — sync log
-  POST /api/search/rebuild      — rebuild in-memory index
-  GET  /api/stats               — engine stats
+  GET  /api/sync/live           — real-time sync progress
+  GET  /api/sync/history        — sync log history
+  GET  /api/sync/status         — latest sync status per table
+  GET  /api/stats               — engine and DB stats
+  POST /api/download-zip        — download product images as ZIP
+  GET  /api/settings            — get DB settings (password masked)
+  POST /api/settings            — save DB settings
+  POST /api/settings/test       — test DB connection
 """
 
 import os
@@ -24,7 +42,7 @@ from flask import Flask, render_template, request, jsonify, abort, send_file
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import SECRET_KEY, DEBUG, HOST, PORT, SEARCH_DEFAULT_K, SYNC_TABLES
 from db.database import init_db, get_connection, dict_from_row
-from modules.fuzzy_search import get_engine
+from modules.fuzzy_search import get_engine, apply_synonyms
 from modules.sync import sync_all, sync_all_background, sync_table, get_sync_status, get_sync_history, get_live_state
 from modules.autocomplete import get_suggestions
 from modules.zip_builder import build_zip
@@ -34,10 +52,14 @@ from modules.settings_manager import (
     test_connection,
     get_mysql_config,
 )
+from routes.search_routes import search_bp
 
 # ── App setup ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+
+# Register search blueprint (all /api/search*, /api/autocomplete, /api/cache/*)
+app.register_blueprint(search_bp)
 
 
 # ── Jinja filter: resolve product image path → full URL ───────────────────────
@@ -55,32 +77,33 @@ def img_url_filter(path: str) -> str:
     """
     if not path:
         return ""
-    # Already a full URL — return unchanged
     if path.startswith("http://") or path.startswith("https://"):
         return path
 
-    clean = path.lstrip("/")   # remove leading slash
+    clean = path.lstrip("/")
 
-    # Case 1: /uploads/img/file.jpg  →  uploads/img/file.jpg  (already correct)
     if clean.startswith("uploads/"):
         return f"https://novxcloud.com/{clean}"
-
-    # Case 2: /img/file.jpg  →  img/file.jpg  (missing /uploads prefix)
     if clean.startswith("img/"):
         return f"https://novxcloud.com/uploads/{clean}"
-
-    # Case 3: bare filename  →  assume uploads/img/
     if "/" not in clean:
         return f"https://novxcloud.com/uploads/img/{clean}"
-
-    # Case 4: any other relative path — prepend domain as-is
     return f"https://novxcloud.com/{clean}"
 
-# Initialise SQLite schema on startup
+
+# Initialise SQLite schema on startup (also creates search_history table)
 init_db()
 
-# Initialise search engine (auto-rebuild every 5 minutes)
-engine = get_engine(rebuild_interval=300)
+# ── Engine initialisation ──────────────────────────────────────────────────────
+# Flask debug mode runs two processes: a reloader parent and a worker child.
+# WERKZEUG_RUN_MAIN='true' is set only in the worker child.
+# We always create the engine (so routes work in both processes), but only
+# start the background refresh thread in the worker to avoid duplicate threads.
+#
+# In production (gunicorn / waitress), WERKZEUG_RUN_MAIN is not set at all,
+# so the background thread starts normally.
+_in_worker = os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not DEBUG
+engine = get_engine(rebuild_interval=300 if _in_worker else None)
 
 
 # ── UI Routes ──────────────────────────────────────────────────────────────────
@@ -90,21 +113,21 @@ def dashboard():
     """Dashboard — counts, top categories, recent sync status."""
     conn = get_connection()
     try:
-        total_products   = conn.execute(
+        total_products     = conn.execute(
             "SELECT COUNT(*) FROM products WHERE is_inactive=0"
         ).fetchone()[0]
         total_all_products = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-        total_categories = conn.execute("SELECT COUNT(*) FROM categories WHERE deleted_at IS NULL").fetchone()[0]
-        total_brands     = conn.execute("SELECT COUNT(*) FROM brands WHERE deleted_at IS NULL").fetchone()[0]
-        total_groups     = conn.execute("SELECT COUNT(*) FROM product_group").fetchone()[0]
+        total_categories   = conn.execute("SELECT COUNT(*) FROM categories WHERE deleted_at IS NULL").fetchone()[0]
+        total_brands       = conn.execute("SELECT COUNT(*) FROM brands WHERE deleted_at IS NULL").fetchone()[0]
+        total_groups       = conn.execute("SELECT COUNT(*) FROM product_group").fetchone()[0]
         total_transactions = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-        out_of_stock     = conn.execute(
+        out_of_stock       = conn.execute(
             "SELECT COUNT(*) FROM products WHERE out_of_stock=1 AND is_inactive=0"
         ).fetchone()[0]
-        not_for_selling  = conn.execute(
+        not_for_selling    = conn.execute(
             "SELECT COUNT(*) FROM products WHERE not_for_selling=1 AND is_inactive=0"
         ).fetchone()[0]
-        inactive_products = conn.execute(
+        inactive_products  = conn.execute(
             "SELECT COUNT(*) FROM products WHERE is_inactive=1"
         ).fetchone()[0]
 
@@ -175,21 +198,90 @@ def dashboard():
 
 @app.route("/search")
 def index():
-    """Main search page."""
-    query   = request.args.get("q", "").strip()
-    top_k   = int(request.args.get("k", SEARCH_DEFAULT_K))
-    results = []
-    stats   = engine.stats()
+    """
+    Main search page — supports pagination, filters, and sort.
+    Passes all parameters to the template for UI rendering.
+    """
+    query    = request.args.get("q", "").strip()
+    page     = max(1, int(request.args.get("page", 1) or 1))
+    limit    = min(max(1, int(request.args.get("limit", SEARCH_DEFAULT_K) or SEARCH_DEFAULT_K)), 100)
+    sort     = request.args.get("sort", "score").strip()
+    category = request.args.get("category", "").strip()
+    min_price = request.args.get("min_price", "").strip()
+    max_price = request.args.get("max_price", "").strip()
+
+    results      = []
+    total_results = 0
+    total_pages   = 1
+    stats         = engine.stats()
 
     if query:
-        results = engine.search_with_field_scores(query, top_k=top_k)
+        import math
+        filters = {}
+        if category:
+            filters["category"] = category
+        if min_price:
+            try:
+                filters["min_price"] = float(min_price)
+            except ValueError:
+                pass
+        if max_price:
+            try:
+                filters["max_price"] = float(max_price)
+            except ValueError:
+                pass
+
+        all_results = engine.search_with_field_scores(
+            query, top_k=100, filters=filters if filters else None
+        )
+
+        # Sort
+        if sort == "name":
+            all_results.sort(key=lambda r: (r.get("name") or "").lower())
+
+        total_results = len(all_results)
+        total_pages   = max(1, math.ceil(total_results / limit))
+        page          = min(page, total_pages)
+        start         = (page - 1) * limit
+        results       = all_results[start:start + limit]
+
+        # Log search
+        from modules.analytics import log_search
+        log_search(query, total_results)
+
+    # Fetch distinct categories for the filter dropdown
+    conn = get_connection()
+    try:
+        category_rows = conn.execute(
+            """
+            SELECT DISTINCT c.name
+            FROM categories c
+            INNER JOIN products p ON p.category_id = c.id AND p.is_inactive = 0
+            WHERE c.deleted_at IS NULL
+            ORDER BY c.name
+            """
+        ).fetchall()
+        categories = [r["name"] for r in category_rows]
+    finally:
+        conn.close()
 
     return render_template(
         "index.html",
         query=query,
         results=results,
         stats=stats,
-        top_k=top_k,
+        top_k=limit,
+        # Pagination
+        page=page,
+        limit=limit,
+        total_results=total_results,
+        total_pages=total_pages,
+        # Filters & sort
+        sort=sort,
+        category=category,
+        min_price=min_price,
+        max_price=max_price,
+        categories=categories,
         now=datetime.now(),
     )
 
@@ -232,26 +324,6 @@ def sync_page():
 
 # ── JSON API ───────────────────────────────────────────────────────────────────
 
-@app.route("/api/search")
-def api_search():
-    """
-    GET /api/search?q=hookah&k=20
-    Returns JSON list of matching products.
-    """
-    query = request.args.get("q", "").strip()
-    top_k = int(request.args.get("k", SEARCH_DEFAULT_K))
-
-    if not query:
-        return jsonify({"error": "q parameter is required"}), 400
-
-    results = engine.search_with_field_scores(query, top_k=top_k)
-    return jsonify({
-        "query":   query,
-        "count":   len(results),
-        "results": results,
-    })
-
-
 @app.route("/api/product/<int:product_id>")
 def api_product(product_id: int):
     """GET /api/product/<id> — product detail JSON."""
@@ -290,8 +362,8 @@ def api_sync():
     Poll GET /api/sync/live for real-time progress.
     """
     from modules.sync import get_live_state as _live
-    body = request.get_json(silent=True) or {}
-    full = body.get("full", True)
+    body   = request.get_json(silent=True) or {}
+    full   = body.get("full", True)
     tables = body.get("tables", None)
 
     # Reject if already running
@@ -302,16 +374,18 @@ def api_sync():
 
     def _after_sync(results):
         engine.rebuild()
+        from modules.cache import search_cache as _cache
+        _cache.clear()
 
     if tables:
-        # Single-table sync — run synchronously (fast tables only)
-        valid = [t for t in tables if t in SYNC_TABLES]
+        valid   = [t for t in tables if t in SYNC_TABLES]
         results = [sync_table(t, full=full) for t in valid]
         engine.rebuild()
+        from modules.cache import search_cache as _cache
+        _cache.clear()
         return jsonify({"status": "ok", "results": results,
                         "indexed": engine.stats()["total_products"]})
 
-    # Full / delta sync — background thread
     sync_all_background(full=full, callback=_after_sync)
     return jsonify({"status": "started",
                     "message": "Sync started in background. Poll /api/sync/live for progress."})
@@ -336,51 +410,30 @@ def api_sync_status():
     return jsonify(get_sync_status())
 
 
-@app.route("/api/search/rebuild", methods=["POST"])
-def api_rebuild():
-    """POST /api/search/rebuild — rebuild in-memory search index from SQLite."""
-    count = engine.rebuild()
-    return jsonify({"status": "ok", "indexed": count})
-
-
 @app.route("/api/stats")
 def api_stats():
     """GET /api/stats — engine and DB stats."""
     stats = engine.stats()
     conn  = get_connection()
     try:
-        product_count = conn.execute(
+        product_count  = conn.execute(
             "SELECT COUNT(*) FROM products WHERE is_inactive=0"
         ).fetchone()[0]
         brand_count    = conn.execute("SELECT COUNT(*) FROM brands").fetchone()[0]
         category_count = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
+        search_count   = conn.execute("SELECT COUNT(*) FROM search_history").fetchone()[0]
     finally:
         conn.close()
 
+    from modules.cache import search_cache as _cache
     return jsonify({
         **stats,
-        "db_products":   product_count,
-        "db_brands":     brand_count,
-        "db_categories": category_count,
+        "db_products":    product_count,
+        "db_brands":      brand_count,
+        "db_categories":  category_count,
+        "total_searches": search_count,
+        "cache":          _cache.stats(),
     })
-
-
-# ── Autocomplete API ───────────────────────────────────────────────────────────
-
-@app.route("/api/autocomplete")
-def api_autocomplete():
-    """
-    GET /api/autocomplete?q=gla&limit=10
-    Returns JSON list of search suggestions.
-    """
-    query = request.args.get("q", "").strip()
-    limit = min(int(request.args.get("limit", 10)), 20)
-
-    if not query or len(query) < 2:
-        return jsonify([])
-
-    suggestions = get_suggestions(query, limit=limit)
-    return jsonify(suggestions)
 
 
 # ── ZIP Download API ───────────────────────────────────────────────────────────
@@ -394,7 +447,7 @@ def api_download_zip():
     Single product  → proxies the image file directly (no ZIP overhead).
     Multiple products → builds and returns a ZIP.
     """
-    body = request.get_json(silent=True) or {}
+    body        = request.get_json(silent=True) or {}
     product_ids = body.get("product_ids", [])
 
     if not product_ids:
@@ -403,7 +456,6 @@ def api_download_zip():
     if len(product_ids) > 200:
         return jsonify({"error": "Maximum 200 products per download"}), 400
 
-    # Fetch product image data from SQLite
     conn = get_connection()
     try:
         placeholders = ",".join("?" * len(product_ids))
@@ -419,12 +471,13 @@ def api_download_zip():
 
     products = [dict(r) for r in rows]
 
-    # ── Single image — proxy directly, no ZIP ─────────────────────────────────
+    # ── Single image — proxy directly ─────────────────────────────────────────
     if len(products) == 1:
         from modules.zip_builder import resolve_image_url
         import urllib.request as urlreq
         import urllib.error
-        import os
+        import io
+        import re
 
         p   = products[0]
         raw = p.get("main_image") or p.get("image") or ""
@@ -436,19 +489,16 @@ def api_download_zip():
         try:
             req = urlreq.Request(url, headers={"User-Agent": "Mozilla/5.0 FuzzySearch/1.0"})
             with urlreq.urlopen(req, timeout=10) as resp:
-                data     = resp.read()
-                ctype    = resp.headers.get("Content-Type", "image/jpeg")
+                data  = resp.read()
+                ctype = resp.headers.get("Content-Type", "image/jpeg")
 
-            # Build a clean filename from product name + extension
             ext = os.path.splitext(url.split("?")[0])[-1].lower()
             if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
                 ext = ".jpg"
-            import re
             safe_name = re.sub(r'[^\w\s-]', '', p.get("name", "image")).strip()
             safe_name = re.sub(r'\s+', '_', safe_name)[:80]
             filename  = f"{safe_name}{ext}"
 
-            import io
             return send_file(
                 io.BytesIO(data),
                 mimetype=ctype,
@@ -465,13 +515,9 @@ def api_download_zip():
     zip_buffer, stats = build_zip(products)
 
     if stats["downloaded"] == 0:
-        return jsonify({
-            "error": "No images could be downloaded",
-            "stats": stats,
-        }), 422
+        return jsonify({"error": "No images could be downloaded", "stats": stats}), 422
 
     filename = f"product_images_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-
     return send_file(
         zip_buffer,
         mimetype="application/zip",
@@ -501,11 +547,8 @@ def api_settings_save():
     """
     POST /api/settings
     Body: {host, port, database, user, password}
-    Saves to db_settings.json.  Empty password keeps the existing one.
     """
-    body = request.get_json(silent=True) or {}
-
-    # Load existing so we can preserve password if not provided
+    body    = request.get_json(silent=True) or {}
     current = load_settings()
 
     new_settings = {
@@ -516,7 +559,6 @@ def api_settings_save():
         "password": body.get("password", current["password"]),
     }
 
-    # If password field was sent as the masked placeholder, keep existing
     if new_settings["password"] in ("••••••••", ""):
         if body.get("password", "") in ("••••••••", ""):
             new_settings["password"] = current["password"]
@@ -527,12 +569,8 @@ def api_settings_save():
 
 @app.route("/api/settings/test", methods=["POST"])
 def api_settings_test():
-    """
-    POST /api/settings/test
-    Body: {host, port, database, user, password}
-    Tests the connection WITHOUT saving.
-    """
-    body = request.get_json(silent=True) or {}
+    """POST /api/settings/test — test connection without saving."""
+    body    = request.get_json(silent=True) or {}
     current = load_settings()
 
     host     = body.get("host",     current["host"]).strip()
@@ -541,7 +579,6 @@ def api_settings_test():
     user     = body.get("user",     current["user"]).strip()
     password = body.get("password", current["password"])
 
-    # If masked placeholder sent, use stored password
     if password in ("••••••••",):
         password = current["password"]
 
@@ -555,6 +592,8 @@ def api_settings_test():
 def not_found(e):
     if request.path.startswith("/api/"):
         return jsonify({"error": "Not found"}), 404
+    if request.path == "/favicon.ico":
+        return "", 204   # No Content — silences browser favicon requests
     return render_template("404.html"), 404
 
 

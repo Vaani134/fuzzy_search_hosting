@@ -1,21 +1,23 @@
 """
 modules/fuzzy_search.py
 -----------------------
-Module 2 & 3 — Fuzzy search engine with 3-algorithm blend.
+Core fuzzy search engine with:
+  - 3-algorithm blend (token_set_ratio, WRatio, partial_ratio)
+  - Synonym normalisation before scoring
+  - Score boosting (exact match, startswith)
+  - In-memory product index rebuilt from SQLite
+  - Optional background auto-rebuild thread
 
-Algorithms
-----------
-  token_set_ratio  weight 0.5  — word order irrelevant, partial overlap
-  WRatio           weight 0.3  — typo tolerance
-  partial_ratio    weight 0.2  — short query inside long string
+Algorithms & weights
+--------------------
+  token_set_ratio  0.5  — word order irrelevant, partial overlap
+  WRatio           0.3  — typo tolerance
+  partial_ratio    0.2  — short query inside long string
 
-The engine loads product data from SQLite (with brand & category names joined),
-builds a normalised index in memory, and scores queries at runtime.
-
-Two embedding/index modes
---------------------------
-  manual   — call engine.rebuild() explicitly
-  interval — a background thread rebuilds the index every N seconds
+Boosting rules (applied on top of blend score, capped at 100)
+--------------------------------------------------------------
+  Exact match (normalised)   → +20
+  Starts-with match          → +10
 """
 
 import re
@@ -34,6 +36,68 @@ try:
     RAPIDFUZZ_AVAILABLE = True
 except ImportError:
     RAPIDFUZZ_AVAILABLE = False
+
+
+# ── Synonym dictionary ─────────────────────────────────────────────────────────
+# Maps user-typed variants → canonical search term.
+# Keys are lowercase; values are the canonical form used for scoring.
+# Add new synonyms here — no code changes needed elsewhere.
+SYNONYMS: Dict[str, str] = {
+    # Hookah / shisha variants
+    "hooka":    "hookah",
+    "hokkah":   "hookah",
+    "sheesha":  "hookah",
+    "shisha":   "hookah",
+    "narghile": "hookah",
+    "nargile":  "hookah",
+    # Grinder variants
+    "grider":   "grinder",
+    "griders":  "grinders",
+    # Cigarette variants
+    "cigartte": "cigarette",
+    "cigaret":  "cigarette",
+    "cigaretts":"cigarettes",
+    # Vape / e-cig
+    "vap":      "vape",
+    "ecig":     "e-cigarette",
+    "e cig":    "e-cigarette",
+    # Energy drink
+    "enrgy":    "energy",
+    # Lighter
+    "liter":    "lighter",
+    "litre":    "lighter",
+    # Pipe
+    "pip":      "pipe",
+    # Tobacco
+    "tobaco":   "tobacco",
+    "tobcco":   "tobacco",
+    # Charcoal
+    "charcol":  "charcoal",
+    "charcole": "charcoal",
+    # Blunt / wrap
+    "blunt":    "blunt wrap",
+    "wraps":    "wrap",
+}
+
+
+def apply_synonyms(query: str) -> str:
+    """
+    Replace known synonym tokens in `query` with their canonical forms.
+
+    Uses word-boundary regex matching so that short synonyms like "pip"
+    don't accidentally match inside longer words like "pipe".
+
+    Returns the expanded query (may be identical to input if no synonyms found).
+    """
+    q = query.lower().strip()
+
+    # Sort by length descending so multi-word phrases are matched first
+    for variant, canonical in sorted(SYNONYMS.items(), key=lambda x: -len(x[0])):
+        # Use word boundaries (\b) to avoid partial-word replacement
+        pattern = r'\b' + re.escape(variant) + r'\b'
+        q = re.sub(pattern, canonical, q)
+
+    return q
 
 
 # ── Text normaliser ────────────────────────────────────────────────────────────
@@ -87,6 +151,33 @@ def blend_score(query: str, normalized_text: str, raw_text: str) -> float:
     return max(score_n, score_r)
 
 
+def apply_boost(base_score: float, query_n: str, product_name_n: str) -> float:
+    """
+    Apply deterministic boosting rules on top of the blend score.
+
+    Rules (applied in order, cumulative):
+      +20  exact match on normalised product name
+      +10  product name starts with the query
+
+    The final score is capped at 100.
+
+    Parameters
+    ----------
+    base_score     : blend score (0–100)
+    query_n        : normalised query string
+    product_name_n : normalised product name
+    """
+    boost = 0.0
+
+    if query_n and product_name_n:
+        if query_n == product_name_n:
+            boost += 20.0
+        elif product_name_n.startswith(query_n):
+            boost += 10.0
+
+    return min(base_score + boost, 100.0)
+
+
 # ── Main engine ────────────────────────────────────────────────────────────────
 
 class FuzzySearchEngine:
@@ -118,11 +209,11 @@ class FuzzySearchEngine:
         self.min_score         = min_score
         self.rebuild_interval  = rebuild_interval
 
-        self._items:            List[Dict[str, Any]] = []
-        self._raw_strings:      List[str] = []
+        self._items:              List[Dict[str, Any]] = []
+        self._raw_strings:        List[str] = []
         self._normalized_strings: List[str] = []
-        self._lock             = threading.RLock()
-        self._last_built:      Optional[float] = None
+        self._lock                = threading.RLock()
+        self._last_built:         Optional[float] = None
 
         # Build index on startup
         self.rebuild()
@@ -163,6 +254,7 @@ class FuzzySearchEngine:
                     p.is_inactive,
                     p.product_group_id,
                     p.group_variation_name,
+                    p.category_id,
                     COALESCE(b.name, '')  AS brand_name,
                     COALESCE(c.name, '')  AS category_name,
                     COALESCE(pg.name, '') AS group_name
@@ -219,38 +311,85 @@ class FuzzySearchEngine:
 
     # ── Search ─────────────────────────────────────────────────────────────────
 
-    def search(self, query: str, top_k: int = SEARCH_DEFAULT_K) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        top_k: int = SEARCH_DEFAULT_K,
+        filters: Optional[Dict] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        Search products.
+        Search products with optional pre-filtering.
+
+        Filters applied BEFORE fuzzy scoring (on the in-memory index):
+            category   : str  — exact category_name match (case-insensitive)
+            min_price  : float — minimum sales_price or srp
+            max_price  : float — maximum sales_price or srp
 
         Returns list of product dicts enriched with:
-            score       — blend score 0–100
+            score       — boosted blend score 0–100
             score_pct   — same value (for template display)
             score_label — "high" | "medium" | "low"
         Sorted by score descending.
         """
         top_k = min(top_k, SEARCH_MAX_K)
-        query_n = normalize(query)
+
+        # Apply synonym expansion before normalising
+        expanded_query = apply_synonyms(query)
+        query_n = normalize(expanded_query)
         if not query_n:
             return []
 
         with self._lock:
-            items       = self._items
-            raw_strs    = self._raw_strings
-            norm_strs   = self._normalized_strings
+            items     = self._items
+            raw_strs  = self._raw_strings
+            norm_strs = self._normalized_strings
 
         if not items:
+            return []
+
+        # ── Pre-filter: apply category / price filters on the index ───────────
+        filters = filters or {}
+        category_filter  = (filters.get("category") or "").strip().lower()
+        min_price_filter = filters.get("min_price")
+        max_price_filter = filters.get("max_price")
+
+        if category_filter or min_price_filter is not None or max_price_filter is not None:
+            filtered_indices = []
+            for i, item in enumerate(items):
+                # Category filter
+                if category_filter:
+                    item_cat = (item.get("category_name") or "").lower()
+                    if category_filter not in item_cat:
+                        continue
+                # Price filter — use sales_price if available, else srp
+                price = item.get("sales_price") or item.get("srp")
+                if min_price_filter is not None and (price is None or price < min_price_filter):
+                    continue
+                if max_price_filter is not None and (price is None or price > max_price_filter):
+                    continue
+                filtered_indices.append(i)
+
+            # Build filtered sub-lists for scoring
+            f_items     = [items[i]     for i in filtered_indices]
+            f_raw_strs  = [raw_strs[i]  for i in filtered_indices]
+            f_norm_strs = [norm_strs[i] for i in filtered_indices]
+        else:
+            f_items     = items
+            f_raw_strs  = raw_strs
+            f_norm_strs = norm_strs
+
+        if not f_items:
             return []
 
         # Pass 1 — fast WRatio scan to get top candidates (2× top_k)
         fast_matches = process.extract(
             query_n,
-            norm_strs,
+            f_norm_strs,
             scorer=fuzz.WRatio,
             limit=top_k * 2,
         )
 
-        # Pass 2 — full 3-way blend re-score
+        # Pass 2 — full 3-way blend re-score + boosting
         results = []
         seen    = set()
 
@@ -259,26 +398,35 @@ class FuzzySearchEngine:
                 continue
             seen.add(index)
 
-            score = blend_score(query_n, norm_strs[index], raw_strs[index])
-            if score < self.min_score:
+            base_score = blend_score(query_n, f_norm_strs[index], f_raw_strs[index])
+            if base_score < self.min_score:
                 continue
 
-            result = dict(items[index])
-            result["score"]       = round(score, 2)
-            result["score_pct"]   = round(score, 2)
-            result["score_label"] = self._label(score)
+            # Apply boosting based on product name
+            product_name_n = normalize(f_items[index].get("name", ""))
+            final_score    = apply_boost(base_score, query_n, product_name_n)
+
+            result = dict(f_items[index])
+            result["score"]       = round(final_score, 2)
+            result["score_pct"]   = round(final_score, 2)
+            result["score_label"] = self._label(final_score)
             results.append(result)
 
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:top_k]
 
-    def search_with_field_scores(self, query: str, top_k: int = SEARCH_DEFAULT_K) -> List[Dict[str, Any]]:
+    def search_with_field_scores(
+        self,
+        query: str,
+        top_k: int = SEARCH_DEFAULT_K,
+        filters: Optional[Dict] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Same as search() but also returns per-field scores.
         Useful for debugging and bucketing.
         """
-        results  = self.search(query, top_k)
-        query_n  = normalize(query)
+        results  = self.search(query, top_k, filters=filters)
+        query_n  = normalize(apply_synonyms(query))
 
         for r in results:
             r["field_scores"] = {
@@ -316,21 +464,19 @@ class FuzzySearchEngine:
             }
 
 
-# ── Module-level singleton (lazy) ──────────────────────────────────────────────
+# ── Module-level singleton ─────────────────────────────────────────────────────
 _engine: Optional[FuzzySearchEngine] = None
 _engine_lock = threading.Lock()
 
 
 def get_engine(rebuild_interval: Optional[int] = None) -> FuzzySearchEngine:
     """
-    Return the module-level singleton engine.
-    Creates it on first call.
+    Return the module-level singleton engine, creating it on first call.
 
-    Parameters
-    ----------
-    rebuild_interval : int or None
-        Seconds between automatic index rebuilds.
-        Pass 300 for a 5-minute refresh cycle.
+    The rebuild_interval is only honoured on the FIRST call (when the engine
+    is created). Subsequent calls return the existing instance unchanged.
+    This prevents duplicate background threads when the module is imported
+    multiple times (e.g. Flask debug reloader).
     """
     global _engine
     if _engine is None:

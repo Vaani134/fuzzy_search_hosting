@@ -2,10 +2,51 @@
 
 {% block title %}Fuzzy Product Search{% endblock %}
 
+{% block extra_head %}
+<style>
+  /* ── Filter panel ── */
+  .filter-panel {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: .75rem;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1.25rem;
+  }
+  .filter-panel .form-label { font-size: .8rem; font-weight: 600; color: #374151; margin-bottom: .2rem; }
+  .filter-panel .form-control,
+  .filter-panel .form-select { font-size: .875rem; }
+
+  /* ── Loading overlay ── */
+  #search-loading {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(255,255,255,.6);
+    z-index: 2000;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: .75rem;
+  }
+  #search-loading.active { display: flex; }
+  #search-loading .spinner-border { width: 3rem; height: 3rem; color: var(--brand-primary); }
+
+  /* ── Pagination ── */
+  .pagination .page-link { border-radius: .375rem !important; margin: 0 2px; }
+  .pagination .page-item.active .page-link { background: var(--brand-primary); border-color: var(--brand-primary); }
+</style>
+{% endblock %}
+
 {% block content %}
 
+<!-- ── Loading overlay ── -->
+<div id="search-loading">
+  <div class="spinner-border" role="status"></div>
+  <span class="text-muted fw-semibold">Searching…</span>
+</div>
+
 <!-- ── Hero / Search bar ── -->
-<div class="text-center mb-5 mt-2">
+<div class="text-center mb-4 mt-2">
   <h1 class="fw-bold mb-1" style="font-size:2rem;">
     <i class="bi bi-search text-primary me-2"></i>Product Search
   </h1>
@@ -13,7 +54,7 @@
     Typo-tolerant &bull; Word-order independent &bull; Partial keyword matching
   </p>
 
-  <form method="GET" action="/search" class="search-wrapper">
+  <form method="GET" action="/search" class="search-wrapper" id="search-form" onsubmit="showLoading()">
     <div class="input-group shadow-sm">
       <input
         type="text"
@@ -29,7 +70,12 @@
         <i class="bi bi-search me-1"></i>Search
       </button>
     </div>
-    <input type="hidden" name="k" value="{{ top_k }}" />
+    <!-- Preserve current filter/sort/limit state across searches -->
+    <input type="hidden" name="limit"     value="{{ limit }}" />
+    <input type="hidden" name="sort"      value="{{ sort }}" />
+    <input type="hidden" name="category"  value="{{ category }}" />
+    <input type="hidden" name="min_price" value="{{ min_price }}" />
+    <input type="hidden" name="max_price" value="{{ max_price }}" />
   </form>
 
   <!-- Stats pills -->
@@ -39,11 +85,83 @@
     </span>
     {% if query %}
     <span class="stat-pill">
-      <i class="bi bi-list-check me-1"></i>{{ results|length }} results
+      <i class="bi bi-list-check me-1"></i>{{ total_results }} results
     </span>
     {% endif %}
   </div>
 </div>
+
+<!-- ── Filter / Sort panel (shown when there's a query or filters active) ── -->
+{% if query or category or min_price or max_price %}
+<form method="GET" action="/search" id="filter-form" onsubmit="showLoading()">
+  <input type="hidden" name="q"     value="{{ query }}" />
+  <input type="hidden" name="page"  value="1" />
+  <input type="hidden" name="limit" value="{{ limit }}" />
+
+  <div class="filter-panel">
+    <div class="row g-2 align-items-end">
+
+      <!-- Category filter -->
+      <div class="col-12 col-sm-6 col-md-3">
+        <label class="form-label"><i class="bi bi-tags me-1"></i>Category</label>
+        <select name="category" class="form-select form-select-sm" onchange="this.form.submit(); showLoading();">
+          <option value="">All categories</option>
+          {% for cat in categories %}
+          <option value="{{ cat }}" {% if cat == category %}selected{% endif %}>{{ cat }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <!-- Min price -->
+      <div class="col-6 col-sm-3 col-md-2">
+        <label class="form-label"><i class="bi bi-currency-dollar me-1"></i>Min Price</label>
+        <input type="number" name="min_price" class="form-control form-control-sm"
+               placeholder="0" min="0" step="0.01" value="{{ min_price }}" />
+      </div>
+
+      <!-- Max price -->
+      <div class="col-6 col-sm-3 col-md-2">
+        <label class="form-label"><i class="bi bi-currency-dollar me-1"></i>Max Price</label>
+        <input type="number" name="max_price" class="form-control form-control-sm"
+               placeholder="Any" min="0" step="0.01" value="{{ max_price }}" />
+      </div>
+
+      <!-- Sort -->
+      <div class="col-6 col-sm-4 col-md-2">
+        <label class="form-label"><i class="bi bi-sort-down me-1"></i>Sort by</label>
+        <select name="sort" class="form-select form-select-sm" onchange="this.form.submit(); showLoading();">
+          <option value="score" {% if sort == 'score' %}selected{% endif %}>Best Match</option>
+          <option value="name"  {% if sort == 'name'  %}selected{% endif %}>Name A–Z</option>
+        </select>
+      </div>
+
+      <!-- Results per page -->
+      <div class="col-6 col-sm-4 col-md-2">
+        <label class="form-label"><i class="bi bi-grid me-1"></i>Per page</label>
+        <select name="limit" class="form-select form-select-sm" onchange="this.form.submit(); showLoading();">
+          {% for n in [10, 20, 50] %}
+          <option value="{{ n }}" {% if limit == n %}selected{% endif %}>{{ n }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <!-- Apply / Clear buttons -->
+      <div class="col-12 col-md-1 d-flex gap-2">
+        <button type="submit" class="btn btn-primary btn-sm" onclick="showLoading()">
+          <i class="bi bi-funnel me-1"></i>Apply
+        </button>
+        {% if category or min_price or max_price %}
+        <a href="/search?q={{ query | urlencode }}&sort={{ sort }}&limit={{ limit }}"
+           class="btn btn-outline-secondary btn-sm">
+          <i class="bi bi-x"></i>
+        </a>
+        {% endif %}
+      </div>
+
+    </div>
+  </div>
+</form>
+{% endif %}
 
 <!-- ── No query state ── -->
 {% if not query %}
@@ -64,18 +182,30 @@
 <div class="text-center text-muted py-5">
   <i class="bi bi-emoji-frown" style="font-size:4rem; opacity:.2;"></i>
   <p class="mt-3">No products matched <strong>"{{ query }}"</strong>.</p>
-  <p class="small">Try a shorter keyword or check the spelling.</p>
+  <p class="small">Try a shorter keyword, check the spelling, or remove filters.</p>
+  {% if category or min_price or max_price %}
+  <a href="/search?q={{ query | urlencode }}" class="btn btn-outline-primary btn-sm mt-2">
+    <i class="bi bi-x-circle me-1"></i>Clear filters
+  </a>
+  {% endif %}
 </div>
 
 <!-- ── Results grid ── -->
 {% else %}
 
-<!-- Score legend -->
-<div class="d-flex gap-3 mb-3 flex-wrap align-items-center">
-  <small class="text-muted">Match quality:</small>
-  <span class="badge badge-high rounded-pill px-3">✅ High ≥ 70</span>
-  <span class="badge badge-medium rounded-pill px-3">🔵 Good ≥ 50</span>
-  <span class="badge badge-low rounded-pill px-3">🟡 Possible ≥ 35</span>
+<!-- Score legend + result count -->
+<div class="d-flex gap-3 mb-3 flex-wrap align-items-center justify-content-between">
+  <div class="d-flex gap-2 align-items-center flex-wrap">
+    <small class="text-muted">Match quality:</small>
+    <span class="badge badge-high rounded-pill px-3">✅ High ≥ 70</span>
+    <span class="badge badge-medium rounded-pill px-3">🔵 Good ≥ 50</span>
+    <span class="badge badge-low rounded-pill px-3">🟡 Possible ≥ 35</span>
+  </div>
+  <small class="text-muted">
+    Showing {{ (page - 1) * limit + 1 }}–{{ [(page - 1) * limit + results|length, total_results] | min }}
+    of {{ total_results }} results
+    {% if total_pages > 1 %}(page {{ page }} of {{ total_pages }}){% endif %}
+  </small>
 </div>
 
 <div class="row row-cols-1 row-cols-sm-2 row-cols-md-3 row-cols-xl-4 g-4">
@@ -119,9 +249,10 @@
 
       <div class="card-body d-flex flex-column">
 
-        <!-- Name -->
+        <!-- Name (highlighted) -->
         <h6 class="card-title mb-1">
-          <a href="/product/{{ p.id }}" class="text-decoration-none text-dark stretched-link-off">
+          <a href="/product/{{ p.id }}" class="text-decoration-none text-dark stretched-link-off"
+             data-product-name="{{ p.name }}">
             {{ p.name }}
           </a>
         </h6>
@@ -186,38 +317,95 @@
           <a href="/product/{{ p.id }}" class="btn btn-outline-primary btn-sm w-100 mt-2">
             <i class="bi bi-eye me-1"></i>View Details
           </a>
-          <!-- Add to cart -->
-           <!--
-          <button
-            class="btn btn-outline-secondary btn-sm w-100 mt-1 btn-add-cart"
-            data-product-id="{{ p.id }}"
-            data-product-name="{{ p.name | e }}"
-            data-product-img="{{ (p.main_image or p.image) | img_url }}"
-            onclick="handleAddToCart(this)"
-          >
-            <i class="bi bi-download me-1"></i>Add to Cart
-          </button> -->
         </div>
       </div>
     </div>
   </div>
   {% endfor %}
 </div>
+
+<!-- ── Pagination controls ── -->
+{% if total_pages > 1 %}
+<nav class="mt-4 d-flex justify-content-center" aria-label="Search results pages">
+  <ul class="pagination">
+
+    <!-- Previous -->
+    <li class="page-item {% if page <= 1 %}disabled{% endif %}">
+      <a class="page-link"
+         href="/search?q={{ query | urlencode }}&page={{ page - 1 }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
+         onclick="showLoading()">
+        <i class="bi bi-chevron-left"></i>
+      </a>
+    </li>
+
+    <!-- Page numbers (show up to 7 pages around current) -->
+    {% set start_page = [1, page - 3] | max %}
+    {% set end_page   = [total_pages, page + 3] | min %}
+
+    {% if start_page > 1 %}
+    <li class="page-item">
+      <a class="page-link"
+         href="/search?q={{ query | urlencode }}&page=1&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
+         onclick="showLoading()">1</a>
+    </li>
+    {% if start_page > 2 %}
+    <li class="page-item disabled"><span class="page-link">…</span></li>
+    {% endif %}
+    {% endif %}
+
+    {% for p_num in range(start_page, end_page + 1) %}
+    <li class="page-item {% if p_num == page %}active{% endif %}">
+      <a class="page-link"
+         href="/search?q={{ query | urlencode }}&page={{ p_num }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
+         onclick="showLoading()">{{ p_num }}</a>
+    </li>
+    {% endfor %}
+
+    {% if end_page < total_pages %}
+    {% if end_page < total_pages - 1 %}
+    <li class="page-item disabled"><span class="page-link">…</span></li>
+    {% endif %}
+    <li class="page-item">
+      <a class="page-link"
+         href="/search?q={{ query | urlencode }}&page={{ total_pages }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
+         onclick="showLoading()">{{ total_pages }}</a>
+    </li>
+    {% endif %}
+
+    <!-- Next -->
+    <li class="page-item {% if page >= total_pages %}disabled{% endif %}">
+      <a class="page-link"
+         href="/search?q={{ query | urlencode }}&page={{ page + 1 }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
+         onclick="showLoading()">
+        <i class="bi bi-chevron-right"></i>
+      </a>
+    </li>
+
+  </ul>
+</nav>
 {% endif %}
+
+{% endif %}{# end results block #}
 
 {% endblock %}
 
 {% block extra_scripts %}
 <script>
-  // Highlight query terms in product names
+  // ── Loading indicator ──────────────────────────────────────────────────────
+  function showLoading() {
+    document.getElementById("search-loading").classList.add("active");
+  }
+
+  // ── Highlight query terms in product names ─────────────────────────────────
   document.addEventListener("DOMContentLoaded", () => {
     const query = {{ query | tojson }};
     if (!query) return;
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+
     document.querySelectorAll(".card-title a").forEach(el => {
       let html = el.textContent;
       terms.forEach(term => {
-        const re = new RegExp(`(${term})`, "gi");
+        const re = new RegExp(`(${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi");
         html = html.replace(re, '<mark class="bg-warning px-0">$1</mark>');
       });
       el.innerHTML = html;
@@ -227,7 +415,7 @@
     CartManager.refresh();
   });
 
-  // Checkbox handler
+  // ── Checkbox handler ───────────────────────────────────────────────────────
   function handleCardSelect(cb) {
     const id   = parseInt(cb.dataset.productId);
     const name = cb.dataset.productName;
@@ -237,37 +425,11 @@
     if (cb.checked) {
       CartManager.add(id, name, img);
       card?.classList.add("selected");
-      // Open cart panel if first item
       const count = parseInt(document.getElementById("cart-count").textContent || "0");
       if (count === 1) CartManager.toggle();
     } else {
       CartManager.remove(id);
       card?.classList.remove("selected");
-    }
-  }
-
-  // "Add to Cart" button handler
-  function handleAddToCart(btn) {
-    const id   = parseInt(btn.dataset.productId);
-    const name = btn.dataset.productName;
-    const img  = btn.dataset.productImg;
-
-    if (CartManager.has(id)) {
-      CartManager.remove(id);
-      btn.innerHTML = '<i class="bi bi-download me-1"></i>Add to Cart';
-      btn.classList.remove("btn-success");
-      btn.classList.add("btn-outline-secondary");
-      // Uncheck corresponding checkbox
-      const cb = document.querySelector(`.product-select-cb[data-product-id="${id}"]`);
-      if (cb) { cb.checked = false; cb.closest(".product-card")?.classList.remove("selected"); }
-    } else {
-      CartManager.add(id, name, img);
-      btn.innerHTML = '<i class="bi bi-check me-1"></i>In Cart';
-      btn.classList.remove("btn-outline-secondary");
-      btn.classList.add("btn-success");
-      // Check corresponding checkbox
-      const cb = document.querySelector(`.product-select-cb[data-product-id="${id}"]`);
-      if (cb) { cb.checked = true; cb.closest(".product-card")?.classList.add("selected"); }
     }
   }
 </script>
