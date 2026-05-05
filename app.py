@@ -53,6 +53,7 @@ from modules.settings_manager import (
     get_mysql_config,
 )
 from routes.search_routes import search_bp
+from routes.image_search_routes import image_search_bp
 
 # ── App setup ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -60,6 +61,8 @@ app.secret_key = SECRET_KEY
 
 # Register search blueprint (all /api/search*, /api/autocomplete, /api/cache/*)
 app.register_blueprint(search_bp)
+# Register image search blueprint (/api/image-search)
+app.register_blueprint(image_search_bp)
 
 
 # ── Jinja filter: resolve product image path → full URL ───────────────────────
@@ -245,9 +248,18 @@ def index():
         start         = (page - 1) * limit
         results       = all_results[start:start + limit]
 
+        # "Did You Mean" suggestion
+        from modules.fuzzy_search import get_query_suggestion
+        top_names  = [r["name"] for r in all_results[:200] if r.get("name")]
+        top_score  = all_results[0]["score"] if all_results else 0.0
+        suggestion = get_query_suggestion(query, choices=top_names, top_result_score=top_score)
+
         # Log search
         from modules.analytics import log_search
         log_search(query, total_results)
+
+    else:
+        suggestion = None
 
     # Fetch distinct categories for the filter dropdown
     conn = get_connection()
@@ -282,6 +294,7 @@ def index():
         min_price=min_price,
         max_price=max_price,
         categories=categories,
+        suggestion=suggestion,
         now=datetime.now(),
     )
 

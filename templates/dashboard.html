@@ -47,6 +47,9 @@
     <a href="/search" class="btn btn-primary">
       <i class="bi bi-search me-1"></i>Search Products
     </a>
+    <button class="btn btn-outline-primary" id="btnDashRebuild" title="Drop old index and rebuild from SQLite">
+      <i class="bi bi-arrow-clockwise me-1"></i>Rebuild Index
+    </button>
     <a href="/sync" class="btn btn-outline-secondary">
       <i class="bi bi-arrow-repeat me-1"></i>Sync Data
     </a>
@@ -165,11 +168,12 @@
     </div>
   </div>
   <div class="col-6 col-md-3">
-    <div class="card stat-card shadow-sm h-100 p-3">
+    <div class="card stat-card shadow-sm h-100 p-3" id="index-card">
       <div class="d-flex justify-content-between align-items-start">
-        <div>
-          <div class="stat-value text-primary">{{ eng_stats.total_products | default(0) }}</div>
+        <div style="flex:1; min-width:0;">
+          <div class="stat-value text-primary" id="dash-index-count">{{ eng_stats.total_products | default(0) }}</div>
           <div class="stat-label">Indexed for Search</div>
+          <div id="dash-rebuild-status" class="mt-1" style="font-size:.72rem; min-height:1rem;"></div>
         </div>
         <div class="stat-icon bg-primary bg-opacity-10 text-primary">
           <i class="bi bi-lightning"></i>
@@ -375,5 +379,59 @@
 <script>
   // Auto-refresh dashboard every 60 seconds
   setTimeout(() => location.reload(), 60000);
+
+  // ── Rebuild Index button (header + stat card) ──────────────────────────────
+  async function runRebuild() {
+    const btn        = document.getElementById("btnDashRebuild");
+    const countEl    = document.getElementById("dash-index-count");
+    const statusEl   = document.getElementById("dash-rebuild-status");
+    const card       = document.getElementById("index-card");
+
+    const prevCount  = parseInt(countEl.textContent.replace(/,/g, "")) || 0;
+
+    // Disable button, show spinner
+    btn.disabled  = true;
+    btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span>Rebuilding…`;
+
+    // Card: show "clearing" state
+    card.style.outline = "2px solid #fbbf24";
+    statusEl.innerHTML = `<span class="text-warning">
+      <i class="bi bi-hourglass-split me-1"></i>Clearing ${prevCount.toLocaleString()} products…
+    </span>`;
+
+    try {
+      const resp = await fetch("/api/search/rebuild", { method: "POST" });
+      const data = await resp.json();
+      const newCount = data.indexed || 0;
+
+      // Update the stat card count
+      countEl.textContent = newCount.toLocaleString();
+
+      // Card: success state
+      card.style.outline = "2px solid #4ade80";
+      statusEl.innerHTML = `<span class="text-success">
+        <i class="bi bi-check-circle-fill me-1"></i>
+        ${prevCount.toLocaleString()} → <strong>${newCount.toLocaleString()}</strong>
+      </span>`;
+
+      btn.innerHTML = `<i class="bi bi-check-lg me-1"></i>Done`;
+
+      // Reset after 4 seconds
+      setTimeout(() => {
+        card.style.outline = "";
+        statusEl.innerHTML = "";
+        btn.innerHTML      = `<i class="bi bi-arrow-clockwise me-1"></i>Rebuild Index`;
+        btn.disabled       = false;
+      }, 4000);
+
+    } catch (e) {
+      card.style.outline = "2px solid #f87171";
+      statusEl.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle me-1"></i>Failed</span>`;
+      btn.innerHTML      = `<i class="bi bi-arrow-clockwise me-1"></i>Rebuild Index`;
+      btn.disabled       = false;
+    }
+  }
+
+  document.getElementById("btnDashRebuild").addEventListener("click", runRebuild);
 </script>
 {% endblock %}

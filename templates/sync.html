@@ -78,10 +78,24 @@
     <div class="card shadow-sm border-0 h-100">
       <div class="card-body">
         <h6 class="fw-semibold"><i class="bi bi-lightning-fill text-primary me-2"></i>Rebuild Index</h6>
-        <p class="text-muted small mb-3">Reload the in-memory fuzzy search index from current SQLite data.</p>
+        <p class="text-muted small mb-3">
+          Drops the current in-memory index and rebuilds it fresh from SQLite.
+          Run this after a sync or any manual data change.
+        </p>
+
+        <!-- Live index status strip -->
+        <div id="index-status-strip" class="d-flex align-items-center gap-2 mb-3 p-2 rounded"
+             style="background:#f1f5f9; font-size:.8rem;">
+          <i class="bi bi-database text-primary"></i>
+          <span id="index-status-text" class="text-muted">Loading…</span>
+        </div>
+
         <button class="btn btn-primary btn-sm" id="btnRebuild">
-          <i class="bi bi-lightning-fill me-1"></i>Rebuild Index
+          <i class="bi bi-arrow-clockwise me-1"></i>Rebuild Index
         </button>
+
+        <!-- Result toast (shown inline after rebuild) -->
+        <div id="rebuild-result" class="mt-2" style="display:none; font-size:.8rem;"></div>
       </div>
     </div>
   </div>
@@ -415,23 +429,89 @@ document.getElementById("btnFullSync").addEventListener("click", async function 
 });
 
 document.getElementById("btnRebuild").addEventListener("click", async function () {
-  const btn = this;
+  const btn        = this;
+  const resultEl   = document.getElementById("rebuild-result");
+  const statusText = document.getElementById("index-status-text");
+  const strip      = document.getElementById("index-status-strip");
+
+  // Capture the current count before we wipe it
+  const prevCount = parseInt(
+    statusText.textContent.match(/[\d,]+/)?.[0]?.replace(/,/g, "") || "0"
+  );
+
   btn.disabled  = true;
   btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span>Rebuilding…`;
+  resultEl.style.display = "none";
+
+  // Show "clearing" state on the strip
+  strip.style.background = "#fef9c3";
+  statusText.innerHTML   = `<span class="text-warning">
+    <i class="bi bi-hourglass-split me-1"></i>Clearing old index (${prevCount.toLocaleString()} products)…
+  </span>`;
+
   try {
     const resp = await fetch("/api/search/rebuild", { method: "POST" });
     const data = await resp.json();
-    alert(`Index rebuilt — ${data.indexed?.toLocaleString() || 0} products indexed.`);
+    const newCount = data.indexed || 0;
+
+    // Success state
+    strip.style.background = "#f0fdf4";
+    statusText.innerHTML   = `<span class="text-success fw-semibold">
+      <i class="bi bi-check-circle-fill me-1"></i>${newCount.toLocaleString()} products indexed
+    </span>`;
+
+    resultEl.innerHTML = `
+      <div class="d-flex align-items-center gap-2 p-2 rounded" style="background:#f0fdf4; border:1px solid #86efac;">
+        <i class="bi bi-check-circle-fill text-success"></i>
+        <div>
+          <span class="fw-semibold text-success">Index rebuilt successfully</span><br>
+          <span class="text-muted">
+            ${prevCount.toLocaleString()} → <strong>${newCount.toLocaleString()}</strong> products
+            &nbsp;·&nbsp; cache cleared (${data.cache_cleared || 0} entries)
+          </span>
+        </div>
+      </div>`;
+    resultEl.style.display = "block";
+
+    // Auto-hide result after 8 seconds
+    setTimeout(() => { resultEl.style.display = "none"; }, 8000);
+
   } catch (e) {
-    alert("Rebuild failed: " + e.message);
+    strip.style.background = "#fef2f2";
+    statusText.innerHTML   = `<span class="text-danger"><i class="bi bi-x-circle me-1"></i>Rebuild failed</span>`;
+    resultEl.innerHTML     = `<span class="text-danger"><i class="bi bi-x-circle me-1"></i>${e.message}</span>`;
+    resultEl.style.display = "block";
   } finally {
     btn.disabled  = false;
-    btn.innerHTML = `<i class="bi bi-lightning-fill me-1"></i>Rebuild Index`;
+    btn.innerHTML = `<i class="bi bi-arrow-clockwise me-1"></i>Rebuild Index`;
   }
 });
 
+// ── Load current index stats into the strip on page load ──────
+async function loadIndexStats() {
+  const statusText = document.getElementById("index-status-text");
+  const strip      = document.getElementById("index-status-strip");
+  try {
+    const resp = await fetch("/api/stats");
+    const data = await resp.json();
+    const count    = data.total_products || 0;
+    const lastBuilt = data.last_built
+      ? new Date(data.last_built * 1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"})
+      : "—";
+    strip.style.background = "#eff6ff";
+    statusText.innerHTML   = `
+      <i class="bi bi-check-circle text-primary me-1"></i>
+      <strong>${count.toLocaleString()}</strong> products currently indexed
+      &nbsp;·&nbsp; last built at ${lastBuilt}
+    `;
+  } catch {
+    statusText.textContent = "Could not load index stats.";
+  }
+}
+
 // ── Init ───────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
+  loadIndexStats();   // populate the index status strip immediately
   pollLive();
   loadHistory();
   // Slow background poll when idle
