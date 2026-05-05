@@ -10,7 +10,7 @@ Endpoint
 Request
 -------
   Content-Type: multipart/form-data
-    file      : (required) image file — JPEG, PNG, WEBP, or GIF
+    file      : image file — JPEG, PNG, WEBP, or GIF  (field name "file" OR "image")
     top_k     : (optional) max results to return, default 20, max 100
 
   OR Content-Type: application/octet-stream
@@ -100,10 +100,16 @@ def api_image_search():
 
     # ── Read image from request ───────────────────────────────────────────────
     if request.content_type and request.content_type.startswith("multipart/form-data"):
-        # Standard HTML form upload
-        file = request.files.get("file")
+        # Accept both "file" and "image" as the field name so the API works
+        # regardless of which name the client uses.
+        file = request.files.get("file") or request.files.get("image")
         if not file:
-            return jsonify({"error": "No file provided. Send an image in the 'file' field."}), 400
+            return jsonify({
+                "error": (
+                    "No file provided. "
+                    "Send an image in the 'file' or 'image' field."
+                )
+            }), 400
         filename    = file.filename or ""
         image_bytes = file.read()
 

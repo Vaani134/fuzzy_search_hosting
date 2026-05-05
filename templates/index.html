@@ -34,6 +34,48 @@
   /* ── Pagination ── */
   .pagination .page-link { border-radius: .375rem !important; margin: 0 2px; }
   .pagination .page-item.active .page-link { background: var(--brand-primary); border-color: var(--brand-primary); }
+
+  /* ── Camera button ── */
+  #btn-image-search {
+    border-left: none;
+    background: #fff;
+    border-color: #dee2e6;
+    color: #6b7280;
+    transition: color .15s, background .15s;
+  }
+  #btn-image-search:hover { color: var(--brand-primary); background: #eff6ff; }
+
+  /* ── Image search status (uploading / error) ── */
+  #img-search-status {
+    display: none;
+    font-size: .85rem;
+  }
+  #img-search-status.show { display: flex; }
+
+  /* ── Image preview panel (Google Lens style) ── */
+  #img-preview-panel {
+    display: none;
+    max-width: 680px;
+    margin: .75rem auto 0;
+  }
+  #img-preview-panel.show { display: flex; }
+  #img-preview-thumb {
+    width: 64px;
+    height: 64px;
+    object-fit: cover;
+    border-radius: .5rem;
+    border: 2px solid #bfdbfe;
+    flex-shrink: 0;
+  }
+  #img-preview-panel .img-preview-body {
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+  }
+  #btn-clear-image {
+    flex-shrink: 0;
+    font-size: .8rem;
+  }
 </style>
 {% endblock %}
 
@@ -66,10 +108,17 @@
         autocomplete="off"
         autofocus
       />
+      <!-- Camera icon: opens image file picker -->
+      <button type="button" class="btn btn-outline-secondary" id="btn-image-search"
+              title="Search by image">
+        <i class="bi bi-camera" id="img-btn-icon"></i>
+      </button>
       <button class="btn btn-primary search-btn" type="submit">
         <i class="bi bi-search me-1"></i>Search
       </button>
     </div>
+    <!-- Hidden file input — triggered by the camera button -->
+    <input type="file" id="image-file-input" accept="image/*" style="display:none;" />
     <!-- Preserve current filter/sort/limit state across searches -->
     <input type="hidden" name="limit"     value="{{ limit }}" />
     <input type="hidden" name="sort"      value="{{ sort }}" />
@@ -77,6 +126,35 @@
     <input type="hidden" name="min_price" value="{{ min_price }}" />
     <input type="hidden" name="max_price" value="{{ max_price }}" />
   </form>
+
+  <!-- Image search status: shown while uploading / on error -->
+  <div id="img-search-status" class="mt-2 justify-content-center align-items-center gap-2">
+    <span id="img-status-icon"></span>
+    <span id="img-status-text" class="text-muted"></span>
+  </div>
+
+  <!--
+    Image preview panel — hidden by default.
+    Shown by JS when sessionStorage contains image data from a previous
+    image search.  Keeps the search bar clean (no query pollution).
+  -->
+  <div id="img-preview-panel"
+       class="align-items-center gap-3 p-3 rounded-3 mt-3"
+       style="background:#eff6ff; border:1px solid #bfdbfe;">
+    <img id="img-preview-thumb" src="" alt="Searched image" />
+    <div class="img-preview-body">
+      <div class="fw-semibold text-primary" style="font-size:.85rem;">
+        <i class="bi bi-camera-fill me-1"></i>Searching by image
+      </div>
+      <div class="text-muted mt-1" style="font-size:.8rem;">
+        Detected: <strong id="img-detected-label"></strong>
+      </div>
+    </div>
+    <button type="button" class="btn btn-sm btn-outline-secondary btn-clear-image"
+            id="btn-clear-image" title="Clear image search">
+      <i class="bi bi-x me-1"></i>Clear
+    </button>
+  </div>
 
   <!-- Stats pills -->
   <div class="mt-3 d-flex justify-content-center gap-2 flex-wrap">
@@ -90,8 +168,8 @@
     {% endif %}
   </div>
 
-  <!-- ── "Did You Mean" banner ── -->
-  {% if suggestion and suggestion | lower != query | lower %}
+  <!-- ── "Did You Mean" banner — hidden for image searches ── -->
+  {% if suggestion and suggestion | lower != query | lower and request.args.get('img') != '1' %}
   <div class="mt-3 d-flex justify-content-center">
     <div class="d-inline-flex align-items-center gap-2 px-3 py-2 rounded-pill"
          style="background:#eff6ff; border:1px solid #bfdbfe; font-size:.9rem;">
@@ -450,5 +528,200 @@
       card?.classList.remove("selected");
     }
   }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // IMAGE SEARCH — Google Lens style
+  //
+  // Upload flow:
+  //   1. Camera click → file picker
+  //   2. FileReader reads image → base64 stored in sessionStorage
+  //   3. POST /api/image-search → get query_generated
+  //   4. Store {dataUrl, label, query} in sessionStorage
+  //   5. Redirect to /search?q=<query>&img=1
+  //      — search bar stays EMPTY (no query pollution)
+  //      — img=1 suppresses "Did You Mean" server-side
+  //
+  // Results page restore flow (runs on DOMContentLoaded):
+  //   6. Read sessionStorage → show image preview panel
+  //   7. Display "Detected: <label>" below thumbnail
+  //   8. Clear button → wipe sessionStorage → navigate to /search
+  // ══════════════════════════════════════════════════════════════════════════
+  (function () {
+    const SESSION_KEY = "imgSearch";
+
+    // ── DOM refs ─────────────────────────────────────────────────────────────
+    const btnImg      = document.getElementById("btn-image-search");
+    const fileInput   = document.getElementById("image-file-input");
+    const statusEl    = document.getElementById("img-search-status");
+    const statusIcon  = document.getElementById("img-status-icon");
+    const statusText  = document.getElementById("img-status-text");
+    const btnIcon     = document.getElementById("img-btn-icon");
+    const previewPanel = document.getElementById("img-preview-panel");
+    const previewThumb = document.getElementById("img-preview-thumb");
+    const detectedLabel = document.getElementById("img-detected-label");
+    const btnClear    = document.getElementById("btn-clear-image");
+    const searchInput = document.getElementById("searchInput");
+
+    if (!btnImg) return;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    function setStatus(iconHtml, text, color) {
+      statusIcon.innerHTML   = iconHtml;
+      statusText.textContent = text;
+      statusText.style.color = color || "";
+      statusEl.classList.add("show");
+    }
+
+    function clearStatus() {
+      statusEl.classList.remove("show");
+    }
+
+    function setBtnLoading(on) {
+      btnImg.disabled   = on;
+      btnIcon.className = on ? "spinner-border spinner-border-sm" : "bi bi-camera";
+    }
+
+    function readFileAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload  = e => resolve(e.target.result);
+        reader.onerror = () => reject(new Error("Could not read file"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function saveSession(dataUrl, label, query) {
+      try {
+        sessionStorage.setItem(SESSION_KEY, JSON.stringify({ dataUrl, label, query }));
+      } catch { /* storage full — silently skip preview */ }
+    }
+
+    function loadSession() {
+      try {
+        const raw = sessionStorage.getItem(SESSION_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch { return null; }
+    }
+
+    function clearSession() {
+      sessionStorage.removeItem(SESSION_KEY);
+    }
+
+    // ── Restore preview on results page ──────────────────────────────────────
+    // Runs every page load. If sessionStorage has image data AND the URL
+    // contains img=1, show the preview panel and hide the search input value.
+    const urlParams = new URLSearchParams(window.location.search);
+    const isImageSearch = urlParams.get("img") === "1";
+
+    if (isImageSearch) {
+      const session = loadSession();
+      if (session && session.dataUrl) {
+        // Show preview panel
+        previewThumb.src         = session.dataUrl;
+        detectedLabel.textContent = session.label || session.query || "—";
+        previewPanel.classList.add("show");
+
+        // Keep search bar empty — do NOT put the generated query in the input
+        if (searchInput) searchInput.value = "";
+      } else {
+        // img=1 but no session data (e.g. page refresh) — clean up URL
+        clearSession();
+      }
+    } else {
+      // Normal text search — clear any leftover image session
+      clearSession();
+    }
+
+    // ── Clear button ──────────────────────────────────────────────────────────
+    if (btnClear) {
+      btnClear.addEventListener("click", () => {
+        clearSession();
+        window.location.href = "/search";
+      });
+    }
+
+    // ── Camera button → open file picker ─────────────────────────────────────
+    btnImg.addEventListener("click", () => {
+      fileInput.value = "";
+      fileInput.click();
+    });
+
+    // ── File selected → upload → redirect ────────────────────────────────────
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+
+      if (!file.type.startsWith("image/")) {
+        setStatus(
+          '<i class="bi bi-x-circle-fill text-danger"></i>',
+          "Please select an image file (JPEG, PNG, WEBP, GIF).",
+          "#dc2626"
+        );
+        return;
+      }
+
+      setBtnLoading(true);
+      clearStatus();
+      setStatus(
+        '<span class="spinner-border spinner-border-sm text-primary"></span>',
+        `Analysing "${file.name}"…`,
+        "#6b7280"
+      );
+
+      try {
+        // Read image for preview BEFORE the API call so we have it ready
+        const dataUrl = await readFileAsDataUrl(file);
+
+        // POST to image search API — field name "image"
+        const formData = new FormData();
+        formData.append("image", file);
+
+        const resp = await fetch("/api/image-search", {
+          method: "POST",
+          body:   formData,
+        });
+        const data = await resp.json();
+
+        if (!resp.ok) throw new Error(data.error || `Server error ${resp.status}`);
+
+        const generatedQuery = (data.query_generated || "").trim();
+        const detectedLabelText = (data.labels && data.labels.length)
+          ? data.labels.slice(0, 3).join(", ")
+          : generatedQuery;
+
+        if (!generatedQuery || generatedQuery === "product") {
+          setStatus(
+            '<i class="bi bi-exclamation-circle text-warning"></i>',
+            "Couldn't identify the image. Try a clearer photo.",
+            "#d97706"
+          );
+          setBtnLoading(false);
+          return;
+        }
+
+        // Persist preview data so the results page can restore it
+        saveSession(dataUrl, detectedLabelText, generatedQuery);
+
+        setStatus(
+          '<i class="bi bi-check-circle-fill text-success"></i>',
+          `Detected: "${detectedLabelText}" — loading results…`,
+          "#16a34a"
+        );
+
+        // Redirect — search bar stays EMPTY, img=1 suppresses "Did You Mean"
+        showLoading();
+        window.location.href =
+          `/search?q=${encodeURIComponent(generatedQuery)}&img=1`;
+
+      } catch (err) {
+        setStatus(
+          '<i class="bi bi-x-circle-fill text-danger"></i>',
+          `Image search failed: ${err.message}`,
+          "#dc2626"
+        );
+        setBtnLoading(false);
+      }
+    });
+  })();
 </script>
 {% endblock %}
