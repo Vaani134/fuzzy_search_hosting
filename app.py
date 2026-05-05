@@ -54,6 +54,7 @@ from modules.settings_manager import (
 )
 from routes.search_routes import search_bp
 from routes.image_search_routes import image_search_bp
+from routes.synonym_routes import synonym_bp
 
 # ── App setup ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -63,6 +64,8 @@ app.secret_key = SECRET_KEY
 app.register_blueprint(search_bp)
 # Register image search blueprint (/api/image-search)
 app.register_blueprint(image_search_bp)
+# Register synonym management blueprint (/api/synonyms*)
+app.register_blueprint(synonym_bp)
 
 
 # ── Jinja filter: resolve product image path → full URL ───────────────────────
@@ -94,8 +97,13 @@ def img_url_filter(path: str) -> str:
     return f"https://novxcloud.com/{clean}"
 
 
-# Initialise SQLite schema on startup (also creates search_history table)
+# Initialise SQLite schema on startup (also creates search_history + synonyms tables)
 init_db()
+
+# Reload synonyms from DB now that the table is guaranteed to exist.
+# The first call at module import time may have found an empty DB.
+from modules.fuzzy_search import reload_synonyms as _reload_synonyms
+_reload_synonyms()
 
 # ── Engine initialisation ──────────────────────────────────────────────────────
 # Flask debug mode runs two processes: a reloader parent and a worker child.

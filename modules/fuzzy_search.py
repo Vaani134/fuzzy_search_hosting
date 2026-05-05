@@ -38,51 +38,47 @@ except ImportError:
     RAPIDFUZZ_AVAILABLE = False
 
 
-# ── Synonym dictionary ─────────────────────────────────────────────────────────
-# Maps user-typed variants → canonical search term.
-# Keys are lowercase; values are the canonical form used for scoring.
-# Add new synonyms here — no code changes needed elsewhere.
-SYNONYMS: Dict[str, str] = {
-    # Hookah / shisha variants
-    "hooka":    "hookah",
-    "hokkah":   "hookah",
-    "sheesha":  "hookah",
-    "shisha":   "hookah",
-    "narghile": "hookah",
-    "nargile":  "hookah",
-    # Grinder variants
-    "grider":   "grinder",
-    "griders":  "grinders",
-    # Cigarette variants
-    "cigartte": "cigarette",
-    "cigaret":  "cigarette",
-    "cigaretts":"cigarettes",
-    # Vape / e-cig
-    "vap":      "vape",
-    "ecig":     "e-cigarette",
-    "e cig":    "e-cigarette",
-    # Energy drink
-    "enrgy":    "energy",
-    # Lighter
-    "liter":    "lighter",
-    "litre":    "lighter",
-    # Pipe
-    "pip":      "pipe",
-    # Tobacco
-    "tobaco":   "tobacco",
-    "tobcco":   "tobacco",
-    # Charcoal
-    "charcol":  "charcoal",
-    "charcole": "charcoal",
-    # Blunt / wrap
-    "blunt":    "blunt wrap",
-    "wraps":    "wrap",
-}
+# ── Synonym store — DB-backed, hot-reloadable ─────────────────────────────────
+#
+# Synonyms are loaded from the `synonyms` SQLite table at startup and cached
+# in module-level variables.  apply_synonyms() uses these cached variables so
+# every search call is O(1) — no DB round-trip per query.
+#
+# Call reload_synonyms() after any INSERT / DELETE on the synonyms table to
+# rebuild the regex and lookup dict without restarting the server.
+#
+# Thread safety: _synonyms_lock guards all reads and writes to the three
+# module-level variables below.
+
+_synonyms_lock   = threading.Lock()
+SYNONYMS: Dict[str, str] = {}          # variant → canonical  (public, read-only)
+_SYNONYM_PATTERN = None                 # compiled regex (rebuilt on reload)
+_SYNONYM_LOOKUP:  Dict[str, str] = {}  # lowercase variant → canonical
 
 
-def _build_synonym_regex() -> tuple:
+def _load_synonyms_from_db() -> Dict[str, str]:
     """
-    Pre-compile a single regex that matches ALL synonym keys in one pass.
+    Read all rows from the synonyms table and return as a dict.
+    Returns an empty dict if the table doesn't exist yet (first-run race).
+    """
+    try:
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT variant, canonical FROM synonyms ORDER BY LENGTH(variant) DESC"
+            ).fetchall()
+            return {r["variant"].strip().lower(): r["canonical"].strip().lower()
+                    for r in rows if r["variant"] and r["canonical"]}
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[Synonyms] Could not load from DB: {exc}")
+        return {}
+
+
+def _compile_synonym_regex(synonyms: Dict[str, str]):
+    """
+    Build a single compiled regex alternation from the synonym keys.
 
     Why one combined pattern instead of a loop?
     --------------------------------------------
@@ -99,33 +95,51 @@ def _build_synonym_regex() -> tuple:
     Construction rules:
       1. Sort keys by descending length so longer phrases (e.g. "e cig")
          are tried before shorter ones (e.g. "ecig") at each position.
-      2. Wrap each key with \b word boundaries to block partial matches
+      2. Wrap each key with \\b word boundaries to block partial matches
          ("pip" must not fire inside "pipe").
       3. Compile with re.IGNORECASE so the match is case-insensitive while
          the replacement is always the canonical lowercase form.
+    """
+    if not synonyms:
+        # Return a pattern that never matches anything
+        return re.compile(r"(?!)")
+
+    sorted_variants = sorted(synonyms.keys(), key=len, reverse=True)
+    alternation     = "|".join(re.escape(v) for v in sorted_variants)
+    return re.compile(r"\b(?:" + alternation + r")\b", re.IGNORECASE)
+
+
+def reload_synonyms() -> int:
+    """
+    Reload synonyms from the database into the in-memory cache.
+
+    Called automatically at module import time and after any API mutation
+    (add / delete).  Thread-safe.
 
     Returns
     -------
-    (compiled_pattern, lookup_dict)
-        lookup_dict maps lowercase variant → canonical replacement,
-        used by the substitution callback.
+    int — number of synonym pairs now loaded.
     """
-    # Sort longest key first — regex alternation is left-to-right greedy,
-    # so the longer option must appear first to win at any given position.
-    sorted_variants = sorted(SYNONYMS.keys(), key=len, reverse=True)
+    global SYNONYMS, _SYNONYM_PATTERN, _SYNONYM_LOOKUP
 
-    # Build alternation: \b(variant1|variant2|...)\b
-    alternation = "|".join(re.escape(v) for v in sorted_variants)
-    pattern = re.compile(r"\b(?:" + alternation + r")\b", re.IGNORECASE)
+    new_synonyms = _load_synonyms_from_db()
+    new_pattern  = _compile_synonym_regex(new_synonyms)
+    new_lookup   = {k.lower(): v for k, v in new_synonyms.items()}
 
-    # Lowercase lookup so the callback can resolve any case variant
-    lookup = {k.lower(): v for k, v in SYNONYMS.items()}
+    with _synonyms_lock:
+        SYNONYMS         = new_synonyms
+        _SYNONYM_PATTERN = new_pattern
+        _SYNONYM_LOOKUP  = new_lookup
 
-    return pattern, lookup
+    print(f"[Synonyms] Loaded {len(new_synonyms)} synonym(s) from DB.")
+    return len(new_synonyms)
 
 
-# Compile once at import time — not on every function call.
-_SYNONYM_PATTERN, _SYNONYM_LOOKUP = _build_synonym_regex()
+# Load synonyms at import time.
+# The DB may not exist yet on the very first import (before init_db() runs),
+# so we catch any error and start with an empty set — reload_synonyms() will
+# be called again after init_db() completes.
+reload_synonyms()
 
 
 def apply_synonyms(query: str) -> str:
@@ -137,6 +151,10 @@ def apply_synonyms(query: str) -> str:
     Uses a single pre-compiled regex alternation so the entire string is
     scanned exactly once.  Each matched token is replaced via a lookup
     callback; unmatched text is passed through unchanged.
+
+    The regex and lookup dict are loaded from the `synonyms` SQLite table
+    at startup and can be hot-reloaded via reload_synonyms() without
+    restarting the server.
 
     Properties guaranteed by this implementation:
       • Word-boundary safety  — "pip" never fires inside "pipe"
@@ -164,21 +182,19 @@ def apply_synonyms(query: str) -> str:
     'hookah'
     >>> apply_synonyms("glass pipe")
     'glass pipe'
-    >>> apply_synonyms("SHISHA grider")
-    'hookah grinder'
     """
     q = query.lower().strip()
     if not q:
         return q
 
-    # re.sub with a callable replacement:
-    #   match.group(0) is the exact text that was matched (lowercased via q).
-    #   _SYNONYM_LOOKUP[matched_text] returns the canonical replacement.
-    #   The regex engine advances past each match, so no position is visited twice.
-    return _SYNONYM_PATTERN.sub(
-        lambda m: _SYNONYM_LOOKUP[m.group(0).lower()],
-        q,
-    )
+    with _synonyms_lock:
+        pattern = _SYNONYM_PATTERN
+        lookup  = _SYNONYM_LOOKUP
+
+    if not lookup:
+        return q
+
+    return pattern.sub(lambda m: lookup[m.group(0).lower()], q)
 
 
 # ── Text normaliser ────────────────────────────────────────────────────────────

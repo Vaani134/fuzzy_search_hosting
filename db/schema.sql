@@ -192,3 +192,24 @@ CREATE INDEX IF NOT EXISTS idx_search_history_query          ON search_history(q
 CREATE INDEX IF NOT EXISTS idx_search_history_timestamp      ON search_history(timestamp);
 CREATE INDEX IF NOT EXISTS idx_search_history_zero_result    ON search_history(is_zero_result);
 CREATE INDEX IF NOT EXISTS idx_search_history_last_searched  ON search_history(last_searched);
+
+-- ─── synonyms (user-managed variant → canonical mappings) ────────────────────
+--
+-- Replaces the hardcoded SYNONYMS dict in modules/fuzzy_search.py.
+-- Loaded into memory at startup and reloaded after any API mutation.
+--
+-- variant   : the misspelling / alternate term the user types  (e.g. "hooka")
+-- canonical : the correct product term to search for           (e.g. "hookah")
+-- created_at: when the mapping was added
+--
+-- UNIQUE(variant) ensures each misspelling maps to exactly one canonical form.
+CREATE TABLE IF NOT EXISTS synonyms (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    variant    TEXT    NOT NULL,
+    canonical  TEXT    NOT NULL,
+    created_at TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(variant)
+);
+
+CREATE INDEX IF NOT EXISTS idx_synonyms_variant   ON synonyms(variant);
+CREATE INDEX IF NOT EXISTS idx_synonyms_canonical ON synonyms(canonical);

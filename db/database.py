@@ -119,10 +119,83 @@ def _run_migrations() -> None:
         )
 
         conn.commit()
+
+        # ── Migration 3: synonyms table (added in v4) ─────────────────────────
+        # Created separately so the seed step can check whether the table was
+        # just created (needs seeding) or already existed (skip seeding).
+        _migrate_synonyms(conn)
+
     except Exception as exc:
         print(f"[DB] Migration warning: {exc}")
     finally:
         conn.close()
+
+
+# ── Default synonyms seeded into the DB on first run ──────────────────────────
+# Mirrors the old hardcoded SYNONYMS dict in modules/fuzzy_search.py.
+# These are only inserted when the synonyms table is first created — existing
+# rows are never overwritten, so user edits via the API are preserved.
+_DEFAULT_SYNONYMS = [
+    ("hooka",    "hookah"),
+    ("hokkah",   "hookah"),
+    ("sheesha",  "hookah"),
+    ("shisha",   "hookah"),
+    ("narghile", "hookah"),
+    ("nargile",  "hookah"),
+    ("grider",   "grinder"),
+    ("griders",  "grinders"),
+    ("cigartte", "cigarette"),
+    ("cigaret",  "cigarette"),
+    ("cigaretts","cigarettes"),
+    ("vap",      "vape"),
+    ("ecig",     "e-cigarette"),
+    ("e cig",    "e-cigarette"),
+    ("enrgy",    "energy"),
+    ("liter",    "lighter"),
+    ("litre",    "lighter"),
+    ("pip",      "pipe"),
+    ("tobaco",   "tobacco"),
+    ("tobcco",   "tobacco"),
+    ("charcol",  "charcoal"),
+    ("charcole", "charcoal"),
+    ("blunt",    "blunt wrap"),
+    ("wraps",    "wrap"),
+]
+
+
+def _migrate_synonyms(conn: sqlite3.Connection) -> None:
+    """
+    Create the synonyms table if it doesn't exist, then seed default rows.
+    Uses INSERT OR IGNORE so existing user-added synonyms are never touched.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS synonyms (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            variant    TEXT    NOT NULL,
+            canonical  TEXT    NOT NULL,
+            created_at TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(variant)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_synonyms_variant "
+        "ON synonyms(variant)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_synonyms_canonical "
+        "ON synonyms(canonical)"
+    )
+
+    # INSERT OR IGNORE: only inserts rows whose variant doesn't exist yet.
+    # Safe to run on every startup — never overwrites user edits.
+    conn.executemany(
+        "INSERT OR IGNORE INTO synonyms (variant, canonical) VALUES (?, ?)",
+        _DEFAULT_SYNONYMS,
+    )
+    conn.commit()
+    print(f"[DB] Synonyms table ready ({len(_DEFAULT_SYNONYMS)} defaults seeded if new).")
 
 
 def _add_column_if_missing(
