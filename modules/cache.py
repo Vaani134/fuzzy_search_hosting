@@ -128,13 +128,28 @@ class _RedisCache:
             print(f"[Cache] Redis GET error: {exc}")
             return None
 
+    # def set(self, key: str, data: Any) -> None:
+    #     try:
+    #         serialised = json.dumps(data, ensure_ascii=False)
+    #         # SETEX stores the value with a native TTL — no timestamp needed
+    #         self._client.setex(self._full_key(key), self._ttl, serialised)
+    #     except Exception as exc:
+    #         print(f"[Cache] Redis SET error: {exc}")
+
     def set(self, key: str, data: Any) -> None:
         try:
+            #print(f"[Redis] Attempting SET: {key}")
+
             serialised = json.dumps(data, ensure_ascii=False)
-            # SETEX stores the value with a native TTL — no timestamp needed
+
             self._client.setex(self._full_key(key), self._ttl, serialised)
+
+            #print("[Redis] SET SUCCESS")
+
         except Exception as exc:
             print(f"[Cache] Redis SET error: {exc}")
+
+        
 
     def invalidate(self, key: str) -> None:
         try:

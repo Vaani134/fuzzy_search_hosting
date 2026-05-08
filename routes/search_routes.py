@@ -56,6 +56,7 @@ def _int_param(name: str, default: int = 0) -> int:
 
 @search_bp.route("/api/search")
 def api_search():
+    #print("[DEBUG] api_search route called")
     """
     Paginated, filtered, sorted fuzzy product search.
 
@@ -106,8 +107,18 @@ def api_search():
     active_filters = {k: v for k, v in filters.items() if v not in (None, "")}
 
     # ── Cache lookup ──────────────────────────────────────────────────────────
+
+    # cache_key = search_cache.make_key(query, active_filters, page, limit, sort)
+    # cached    = search_cache.get(cache_key)
+    # if cached is not None:
+    #     return jsonify(cached)
+    # ── Cache lookup ──────────────────────────────────────────────────────────
     cache_key = search_cache.make_key(query, active_filters, page, limit, sort)
-    cached    = search_cache.get(cache_key)
+
+    #print(f"[DEBUG] Cache key: {cache_key}")
+
+    cached = search_cache.get(cache_key)
+
     if cached is not None:
         return jsonify(cached)
 

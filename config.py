@@ -67,5 +67,7 @@ PORT       = int(os.getenv("FLASK_PORT", "5000"))
 # When REDIS_URL is set and Redis is reachable, SearchCache uses Redis.
 # When Redis is unavailable or REDIS_URL is blank, it falls back to the
 # in-memory dict cache automatically — no code changes needed.
-REDIS_URL = os.getenv("REDIS_URL", "")          # e.g. redis://127.0.0.1:6379/0
-REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "fzsearch:")  # namespace prefix
+# REDIS_URL = os.getenv("REDIS_URL", "")          # e.g. redis://127.0.0.1:6379/0
+# REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "fzsearch:")  # namespace prefix
+REDIS_URL = "redis://localhost:6379/0"
+REDIS_KEY_PREFIX = "fzsearch:"
