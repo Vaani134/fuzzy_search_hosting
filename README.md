@@ -1,6 +1,6 @@
 # 🔍 Fuzzy Search App
 
-> A production-grade intelligent product search engine built with Flask, SQLite, and RapidFuzz — featuring typo tolerance, DB-backed synonyms, AI synonym suggestions, composite ranking, query expansion, image search, real-time analytics, Redis caching, and background indexing.
+> A production-grade intelligent product search engine built with Flask, SQLite, and RapidFuzz — featuring typo tolerance, DB-backed synonyms, AI synonym suggestions, composite ranking, query expansion, image search, real-time analytics, Redis caching, and manual API-controlled indexing.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://python.org)
 [![Flask](https://img.shields.io/badge/Flask-3.0.3-black?logo=flask)](https://flask.palletsprojects.com)
@@ -47,7 +47,7 @@ Whether a customer types `"hooka"` instead of `"hookah"`, `"grider"` instead of 
 | 🗄️ **Caching** | Redis cache with automatic in-memory fallback (60s TTL) |
 | 🖼️ **Image Search** | Upload an image → extract labels → fuzzy search (MobileNet or heuristic) |
 | 🔄 **Sync** | MySQL → SQLite sync with cursor-based pagination (handles 488k+ rows) |
-| 🏗️ **Indexing** | In-memory product index rebuilt on startup and every 5 minutes |
+| 🏗️ **Indexing** | In-memory product index rebuilt on startup and manually via API |
 | 📦 **Downloads** | Bulk product image download as ZIP |
 | 🎨 **UI** | Responsive Bootstrap 5 interface with live autocomplete and image search |
 
@@ -381,7 +381,7 @@ For Infrastructure-as-Code deployment, Render also reads from `render.yaml`:
 **Important considerations for Render:**
 
 - **Free Tier Dyno Sleeping**: Free instances sleep after 15 minutes of inactivity. The app will wake on the next request (slow first response, then normal).
-- **Background Threads**: The app has a background index rebuild thread (300s interval). It pauses when the dyno sleeps and resumes when it wakes — this is safe and expected.
+- **Background Threads**: Background automatic index rebuilding is **disabled** to optimize resource usage on free-tier/ephemeral hosting. Use the `POST /api/search/rebuild` endpoint to manually trigger index rebuilds when needed.
 - **Ephemeral Filesystem**: Render instances reset on restart. SQLite database files should be on a persistent disk (configure in render.yaml). Temporary files are cleaned up automatically.
 - **Redis**: Optional. If not configured, the app falls back to in-memory caching automatically.
 - **Multi-Worker Mode**: Gunicorn launches multiple workers (configured in Procfile). Each worker has its own in-memory index and background thread — no coordination needed.
@@ -640,7 +640,7 @@ The cache backend is selected at startup and is transparent to all callers. `GET
 
 ### In-Memory Index
 
-40,938 products → ~56 MB RAM. Rebuilt every 300s by a background thread. The two-pass search strategy (fast WRatio scan → full blend re-score) keeps latency under 100ms.
+40,938 products → ~56 MB RAM. Rebuilt manually via the `POST /api/search/rebuild` endpoint. The two-pass search strategy (fast WRatio scan → full blend re-score) keeps latency under 100ms.
 
 At rebuild time, two ranking signals are loaded and normalised to 0–100:
 - **popularity** — count of `transaction_sell_lines` per product (real sales data)
