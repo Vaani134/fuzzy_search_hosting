@@ -18,8 +18,8 @@ python-dotenv==1.0.1
 redis==5.0.8
 
 # Image Processing (for image search)
-Pillow==10.2.0
-numpy==1.24.3
+Pillow>=11.0.0
+numpy>=2.1.0
 
 # Optional: Machine Learning for Image Classification
 # Uncomment to enable AI-powered image search features

@@ -122,35 +122,10 @@ from modules.fuzzy_search import reload_synonyms as _reload_synonyms
 _reload_synonyms()
 
 # ── Engine initialisation ──────────────────────────────────────────────────────
-# Flask debug mode runs two processes: a reloader parent and a worker child.
-# WERKZEUG_RUN_MAIN='true' is set only in the worker child.
-# We always create the engine (so routes work in both processes), but only
-# start the background refresh thread in the worker to avoid duplicate threads.
-#
-# In production (gunicorn / waitress), WERKZEUG_RUN_MAIN is not set at all,
-# so the background thread starts normally.
-#
-# BACKGROUND THREAD: Automatic index rebuild every 300 seconds
-# ─────────────────────────────────────────────────────────────────────────────
-# The fuzzy search engine rebuilds its in-memory index every 300s to:
-#   • Pick up new/updated products synced from MySQL
-#   • Refresh search_history analytics (trending queries)
-#   • Reload changed synonyms
-#
-# Deployment considerations (Render / ephemeral hosting):
-#   • EXPECTED: Thread may pause if the app is sleeping (free tier dyno pause)
-#   • EXPECTED: Thread restarts when the dyno wakes up
-#   • NO ACTION NEEDED: The search engine gracefully handles thread pauses
-#   • NO PERSISTENCE: Data is rebuilt from SQLite on each index refresh
-#   • SCALING: In multi-worker mode, each worker has its own thread
-#     (they rebuild independently, no coordination needed)
-#   • COST: ~2–5 seconds per rebuild on typical product database sizes
-#
-# To disable auto-rebuild: set rebuild_interval=None
-# To change rebuild interval: set rebuild_interval=<seconds>
-#
-_in_worker = os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not DEBUG
-engine = get_engine(rebuild_interval=300 if _in_worker else None)
+# Background automatic index rebuilding is DISABLED for this environment.
+# We are relying on fully manual index rebuilds via the API.
+# Use POST /api/search/rebuild to refresh the in-memory index.
+engine = get_engine(rebuild_interval=None)
 
 
 # ── UI Routes ──────────────────────────────────────────────────────────────────
