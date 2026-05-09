@@ -2,6 +2,9 @@
 flask==3.0.3
 Werkzeug==3.0.4
 
+# Production WSGI Server (Render deployment)
+gunicorn==22.0.0
+
 # Fuzzy Matching & String Processing
 rapidfuzz==3.9.3
 

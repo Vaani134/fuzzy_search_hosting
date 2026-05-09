@@ -1,0 +1,58 @@
+services:
+  - type: web
+    name: fuzzy-search-engine
+    runtime: python
+    pythonVersion: "3.11"
+    
+    # Build and start commands
+    buildCommand: >
+      pip install --upgrade pip setuptools wheel &&
+      pip install -r requirements.txt
+    
+    startCommand: >
+      gunicorn app:app --workers 2 --threads 2 --worker-class gthread 
+      --timeout 60 --bind 0.0.0.0:$PORT
+    
+    # Environment variables (set via Render dashboard or here)
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: SECRET_KEY
+        # ⚠️  IMPORTANT: Set this in the Render dashboard environment variables!
+        # Do NOT commit the actual key to this file.
+        # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+        value: ${SECRET_KEY}
+      - key: FLASK_HOST
+        value: 0.0.0.0
+      # Render assigns PORT automatically
+    
+    # Optional environment variables for Redis and MySQL
+    # Set these via the Render dashboard if needed:
+    # - REDIS_URL: (if using Render Redis add-on)
+    # - MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
+    
+    # Health check (Render will restart if unhealthy)
+    healthCheckPath: /
+    healthCheckTimeout: 30
+    preDeployCommand: >
+      python -c "import sys; sys.exit(0)" || echo "Pre-deploy check passed"
+    
+    # Resources
+    plan: free
+    # For production: change to standard or higher for better performance
+    
+    # Disk
+    disk:
+      name: fuzzy-search-data
+      mountPath: /data
+      sizeGB: 1
+    
+    # Autoscaling (not available on free tier)
+    # autoDeploy: true
+    
+    # Cron jobs (optional: trigger manual sync on schedule)
+    # cronJobs:
+    #   - schedule: "0 2 * * *"  # 2 AM daily
+    #     command: >
+    #       curl -X POST http://localhost:$PORT/api/sync
+    #       -H "Authorization: Bearer $SYNC_TOKEN"

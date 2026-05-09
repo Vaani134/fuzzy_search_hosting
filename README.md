@@ -290,7 +290,120 @@ python app.py
 
 ---
 
-## 🔍 API Reference
+## � Deployment
+
+### Local Development
+
+```bash
+# 1. Set environment to development
+export FLASK_ENV=development
+
+# 2. Run the app
+python app.py
+
+# The app will start on http://127.0.0.1:5000 with auto-reload enabled
+```
+
+### Production (Gunicorn)
+
+For production deployments, use **Gunicorn** instead of Flask's development server:
+
+```bash
+# Install Gunicorn (already in requirements.txt)
+pip install gunicorn
+
+# Run with Gunicorn (2 workers, 2 threads each)
+gunicorn app:app --workers 2 --threads 2 --worker-class gthread --timeout 60
+```
+
+Configuration tuning:
+- `--workers`: Number of worker processes (rule of thumb: `2 × CPU_cores + 1`)
+- `--threads`: Threads per worker (use 2–4 for I/O-bound apps)
+- `--timeout`: Request timeout in seconds (60s recommended for large syncs)
+- `--bind`: Host and port (default: 127.0.0.1:8000, use 0.0.0.0:PORT for containers)
+
+### Render Deployment
+
+This app is optimized for **Render** (www.render.com), a modern cloud platform similar to Heroku.
+
+#### Setup Steps
+
+1. **Push your code to GitHub**
+   ```bash
+   git init
+   git add .
+   git commit -m "Initial commit"
+   git branch -M main
+   git remote add origin https://github.com/your-username/fuzzy-search-app.git
+   git push -u origin main
+   ```
+
+2. **Connect Render to GitHub**
+   - Log in to Render: https://dashboard.render.com
+   - Click "New" → "Web Service"
+   - Connect your GitHub repo
+   - Select this repository
+
+3. **Configure Render Service**
+   - **Name**: `fuzzy-search-engine` (or your choice)
+   - **Runtime**: Python 3.11
+   - **Build Command**: (auto-detected from Procfile)
+   - **Start Command**: (auto-detected from Procfile)
+   - **Plan**: Starter ($7/month) or Free (limited)
+
+4. **Set Environment Variables** (Render Dashboard → Environment)
+   - `FLASK_ENV=production` (critical!)
+   - `SECRET_KEY=` (generate with: `python -c "import secrets; print(secrets.token_hex(32))"`)
+   - `MYSQL_HOST=` (your MySQL server host)
+   - `MYSQL_PORT=3306`
+   - `MYSQL_USER=` (your MySQL user)
+   - `MYSQL_PASSWORD=` (your MySQL password)
+   - `MYSQL_DATABASE=` (your database name)
+   - `REDIS_URL=` (optional: if using Render Redis add-on, e.g., `redis://...)
+   - `IMAGE_BASE_URL=` (your CDN base URL)
+
+5. **Deploy**
+   - Click "Create Web Service"
+   - Render will build and deploy automatically
+   - Monitor logs in the Render dashboard
+
+#### Using render.yaml (Recommended)
+
+For Infrastructure-as-Code deployment, Render also reads from `render.yaml`:
+
+```bash
+# Render will auto-detect render.yaml at repo root
+# All service configuration goes there (see render.yaml in this repo)
+```
+
+#### Production Environment Notes
+
+**Important considerations for Render:**
+
+- **Free Tier Dyno Sleeping**: Free instances sleep after 15 minutes of inactivity. The app will wake on the next request (slow first response, then normal).
+- **Background Threads**: The app has a background index rebuild thread (300s interval). It pauses when the dyno sleeps and resumes when it wakes — this is safe and expected.
+- **Ephemeral Filesystem**: Render instances reset on restart. SQLite database files should be on a persistent disk (configure in render.yaml). Temporary files are cleaned up automatically.
+- **Redis**: Optional. If not configured, the app falls back to in-memory caching automatically.
+- **Multi-Worker Mode**: Gunicorn launches multiple workers (configured in Procfile). Each worker has its own in-memory index and background thread — no coordination needed.
+
+**Render Performance Tips:**
+
+- Use **Starter plan** ($7/month) for production instead of Free for better performance and reliability
+- Enable **auto-scaling** if available (paid plans)
+- Connect a **Render PostgreSQL** database instead of MySQL if possible (faster, managed)
+- Set appropriate timeouts to match your MySQL sync latency
+
+#### Health Checks
+
+Render monitors the `/` endpoint for health. If it fails 3 times, the instance restarts automatically. The app returns:
+
+```json
+{ "dashboard_ready": true, "products_indexed": 40938, ... }
+```
+
+---
+
+## �🔍 API Reference
 
 ### Search
 

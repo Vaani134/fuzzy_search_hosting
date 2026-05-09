@@ -129,6 +129,26 @@ _reload_synonyms()
 #
 # In production (gunicorn / waitress), WERKZEUG_RUN_MAIN is not set at all,
 # so the background thread starts normally.
+#
+# BACKGROUND THREAD: Automatic index rebuild every 300 seconds
+# ─────────────────────────────────────────────────────────────────────────────
+# The fuzzy search engine rebuilds its in-memory index every 300s to:
+#   • Pick up new/updated products synced from MySQL
+#   • Refresh search_history analytics (trending queries)
+#   • Reload changed synonyms
+#
+# Deployment considerations (Render / ephemeral hosting):
+#   • EXPECTED: Thread may pause if the app is sleeping (free tier dyno pause)
+#   • EXPECTED: Thread restarts when the dyno wakes up
+#   • NO ACTION NEEDED: The search engine gracefully handles thread pauses
+#   • NO PERSISTENCE: Data is rebuilt from SQLite on each index refresh
+#   • SCALING: In multi-worker mode, each worker has its own thread
+#     (they rebuild independently, no coordination needed)
+#   • COST: ~2–5 seconds per rebuild on typical product database sizes
+#
+# To disable auto-rebuild: set rebuild_interval=None
+# To change rebuild interval: set rebuild_interval=<seconds>
+#
 _in_worker = os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not DEBUG
 engine = get_engine(rebuild_interval=300 if _in_worker else None)
 
@@ -457,6 +477,10 @@ def api_sync():
 
     Starts sync in a background thread and returns immediately.
     Poll GET /api/sync/live for real-time progress.
+    
+    ⚠️ SECURITY NOTE: This endpoint is publicly accessible.
+    For production, consider adding API token authentication.
+    See DEPLOYMENT_SECURITY.md for details.
     """
     from modules.sync import get_live_state as _live
     body   = request.get_json(silent=True) or {}

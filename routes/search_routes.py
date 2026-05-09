@@ -271,6 +271,10 @@ def api_rebuild():
     POST /api/search/rebuild
     Rebuild the in-memory search index from SQLite.
     Also clears the search cache so stale results are not served.
+    
+    ⚠️ SECURITY NOTE: This endpoint is publicly accessible.
+    For production, consider adding API token authentication.
+    See DEPLOYMENT_SECURITY.md for details.
     """
     engine = get_engine()
     count  = engine.rebuild()

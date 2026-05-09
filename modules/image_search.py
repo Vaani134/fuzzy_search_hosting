@@ -37,6 +37,20 @@ This module imports ONLY from:
   - Optional third-party: tensorflow / torch / PIL (all guarded by try/except)
 
 It does NOT modify fuzzy_search.py or any other existing module.
+
+Deployment notes (Render / ephemeral hosting)
+----------------------------------------------
+IMPORTANT: This module is designed for ephemeral hosting environments:
+  • All image processing happens in-memory (bytes only, no temp files)
+  • No persistent filesystem writes during image processing
+  • ML models are cached in memory after first load (not persisted to disk)
+  • Suitable for Render free instances with ~512 MB RAM
+  • Compatible with Gunicorn multi-worker deployments
+
+If the app restarts or a worker recycles:
+  • ML models reload on first image classification request (no issue)
+  • Previous images are not retained (expected in ephemeral environments)
+  • Cache miss on model load is acceptable (~1–3 seconds for first inference)
 """
 
 import io

@@ -58,16 +58,27 @@ SCORE_LOW    = 35
 IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL", "https://novxcloud.com")
 
 # ── Flask ──────────────────────────────────────────────────────────────────────
-SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production")
-DEBUG      = os.getenv("FLASK_DEBUG", "true").lower() == "true"
-HOST       = os.getenv("FLASK_HOST", "0.0.0.0")
-PORT       = int(os.getenv("FLASK_PORT", "5000"))
+# SECRET_KEY is REQUIRED for production. Use a strong random value:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+# Set via environment variable: export SECRET_KEY="..."
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    # Development fallback only — MUST be overridden in production
+    if os.getenv("FLASK_ENV") == "production":
+        raise ValueError(
+            "SECRET_KEY environment variable is REQUIRED in production. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+    SECRET_KEY = "dev-key-change-in-production"
+
+DEBUG = os.getenv("FLASK_ENV", "production").lower() != "production"
+HOST = os.getenv("FLASK_HOST", "0.0.0.0")
+PORT = int(os.getenv("FLASK_PORT", "5000"))
 
 # ── Redis (optional search result cache) ──────────────────────────────────────
 # When REDIS_URL is set and Redis is reachable, SearchCache uses Redis.
 # When Redis is unavailable or REDIS_URL is blank, it falls back to the
 # in-memory dict cache automatically — no code changes needed.
-# REDIS_URL = os.getenv("REDIS_URL", "")          # e.g. redis://127.0.0.1:6379/0
-# REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "fzsearch:")  # namespace prefix
-REDIS_URL = "redis://localhost:6379/0"
-REDIS_KEY_PREFIX = "fzsearch:"
+# Example: redis://user:password@localhost:6379/0
+REDIS_URL = os.getenv("REDIS_URL", "")
+REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "fzsearch:")
