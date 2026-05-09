@@ -1,5 +1,30 @@
+# Core Web Framework
 flask==3.0.3
+Werkzeug==3.0.4
+
+# Fuzzy Matching & String Processing
 rapidfuzz==3.9.3
+
+# Database & ORM
 pymysql==1.1.1
+
+# Environment Configuration
 python-dotenv==1.0.1
+
+# Caching & In-Memory Database
 redis==5.0.8
+
+# Image Processing (for image search)
+Pillow==10.2.0
+numpy==1.24.3
+
+# Optional: Machine Learning for Image Classification
+# Uncomment to enable AI-powered image search features
+# tensorflow==2.14.0  (Heavy - ~500MB)
+# torch==2.1.0        (Heavy - ~700MB)
+# torchvision==0.16.0 (Required with torch)
+
+# Development & Debugging (optional)
+# python-dotenv[cli]==1.0.1
+# pytest==7.4.0
+# pytest-flask==1.2.0

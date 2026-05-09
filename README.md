@@ -307,7 +307,7 @@ python app.py
 | `POST` | `/api/cache/clear` | Flush cache |
 
 **`GET /api/search` parameters:**
-
+  
 | Parameter | Default | Description |
 |---|---|---|
 | `q` | required | Search query |
