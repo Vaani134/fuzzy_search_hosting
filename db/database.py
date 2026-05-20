@@ -163,6 +163,19 @@ def _run_migrations() -> None:
         )
         conn.commit()
 
+        # ── Migration 7: source_db_id on synced tables (added in v8) ─────────
+        # Marks which connected_database each row came from.
+        # Existing rows default to 1 (the primary / first database).
+        for tbl in ("products", "brands", "categories", "product_group"):
+            _add_column_if_missing(
+                conn, tbl, "source_db_id",
+                "INTEGER NOT NULL DEFAULT 1",
+            )
+        conn.commit()
+
+        # ── Migration 8: multi-DB infrastructure tables (added in v8) ────────
+        _migrate_multi_db_tables(conn)
+
     except Exception as exc:
         print(f"[DB] Migration warning: {exc}")
     finally:
@@ -268,6 +281,151 @@ def _migrate_synonym_suggestions(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
     print("[DB] synonym_suggestions table ready.")
+
+
+def _migrate_multi_db_tables(conn: sqlite3.Connection) -> None:
+    """
+    Create the multi-DB infrastructure tables introduced in v8.
+    All statements are idempotent (CREATE TABLE IF NOT EXISTS).
+
+    Tables created here:
+      connected_databases — one row per MySQL/ERP source
+      sync_jobs           — per-database sync job tracker (stop flag lives here)
+      sync_checkpoints    — resume-from-crash state per (db, table)
+      product_metrics     — aggregated sales stats (replaces transaction sync)
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS connected_databases (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT    NOT NULL,
+            host          TEXT    NOT NULL,
+            port          INTEGER NOT NULL DEFAULT 3306,
+            username      TEXT    NOT NULL DEFAULT '',
+            password      TEXT    NOT NULL DEFAULT '',
+            database_name TEXT    NOT NULL,
+            last_sync_at  TEXT    DEFAULT NULL,
+            sync_status   TEXT    NOT NULL DEFAULT 'never',
+            created_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_jobs (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            database_id    INTEGER NOT NULL REFERENCES connected_databases(id),
+            status         TEXT    NOT NULL DEFAULT 'pending',
+            progress       INTEGER NOT NULL DEFAULT 0,
+            stop_requested INTEGER NOT NULL DEFAULT 0,
+            current_table  TEXT    DEFAULT NULL,
+            started_at     TEXT    DEFAULT NULL,
+            finished_at    TEXT    DEFAULT NULL,
+            error_msg      TEXT    DEFAULT NULL,
+            created_at     TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sync_jobs_db_id  ON sync_jobs(database_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sync_jobs_status ON sync_jobs(status)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_checkpoints (
+            id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+            database_id               INTEGER NOT NULL,
+            table_name                TEXT    NOT NULL,
+            last_processed_id         INTEGER NOT NULL DEFAULT 0,
+            last_processed_updated_at TEXT    DEFAULT NULL,
+            updated_at                TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(database_id, table_name)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sync_ckpt_db_table "
+        "ON sync_checkpoints(database_id, table_name)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_metrics (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id       INTEGER NOT NULL,
+            source_db_id     INTEGER NOT NULL DEFAULT 1,
+            sales_count      INTEGER NOT NULL DEFAULT 0,
+            popularity_score REAL    NOT NULL DEFAULT 0.0,
+            last_sold_at     TEXT    DEFAULT NULL,
+            updated_at       TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(product_id, source_db_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_product_metrics_pid   "
+        "ON product_metrics(product_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_product_metrics_score "
+        "ON product_metrics(popularity_score)"
+    )
+    conn.commit()
+    print("[DB] Multi-DB infrastructure tables ready.")
+
+
+def seed_primary_database_from_settings() -> None:
+    """
+    One-time migration: if db_settings.json exists and connected_databases
+    is empty, import that file as the first (primary) connected database.
+
+    Safe to call on every startup — exits immediately when already migrated.
+    This preserves backward compatibility: existing single-DB installations
+    keep working without any manual reconfiguration.
+    """
+    import json
+
+    settings_file = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "db_settings.json",
+    )
+
+    conn = get_connection()
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM connected_databases"
+        ).fetchone()[0]
+        if count > 0:
+            return  # already seeded — nothing to do
+
+        if not os.path.exists(settings_file):
+            return  # no legacy settings file — fresh installation
+
+        with open(settings_file, "r", encoding="utf-8") as fh:
+            s = json.load(fh)
+
+        host     = s.get("host", "127.0.0.1")
+        port     = int(s.get("port", 3306))
+        username = s.get("user", "root")
+        password = s.get("password", "")
+        database = s.get("database", "")
+
+        conn.execute(
+            """
+            INSERT INTO connected_databases
+                (id, name, host, port, username, password, database_name)
+            VALUES (1, 'Primary Database', ?, ?, ?, ?, ?)
+            """,
+            (host, port, username, password, database),
+        )
+        conn.commit()
+        print("[DB] Seeded connected_databases from db_settings.json (id=1).")
+    except Exception as exc:
+        print(f"[DB] Primary DB seed warning: {exc}")
+    finally:
+        conn.close()
 
 
 def _add_column_if_missing(

@@ -263,3 +263,94 @@ CREATE TABLE IF NOT EXISTS product_clicks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_product_clicks_count ON product_clicks(click_count);
+
+-- ─── connected_databases (replaces flat db_settings.json for multi-ERP support) ─
+--
+-- Each row represents one MySQL/ERP source database that can be synced into
+-- the local SQLite cache.  The first row (id=1) is auto-seeded from the
+-- existing db_settings.json on first startup (see db/database.py migration).
+--
+-- sync_status values:
+--   never   — database was added but never synced
+--   running — a sync job is currently active
+--   ok      — last sync completed successfully
+--   error   — last sync failed
+--   stopped — last sync was gracefully stopped before completion
+CREATE TABLE IF NOT EXISTS connected_databases (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT    NOT NULL,
+    host          TEXT    NOT NULL,
+    port          INTEGER NOT NULL DEFAULT 3306,
+    username      TEXT    NOT NULL DEFAULT '',
+    password      TEXT    NOT NULL DEFAULT '',
+    database_name TEXT    NOT NULL,
+    last_sync_at  TEXT    DEFAULT NULL,
+    sync_status   TEXT    NOT NULL DEFAULT 'never',
+    created_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ─── sync_jobs (per-database sync job tracker) ────────────────────────────────
+--
+-- One row is created at the start of every sync.  The sync loop reads
+-- stop_requested after every batch — setting it to 1 from the API causes
+-- the loop to save a checkpoint and exit cleanly (no force-kill).
+--
+-- status values: pending | running | completed | failed | stopped
+CREATE TABLE IF NOT EXISTS sync_jobs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    database_id    INTEGER NOT NULL REFERENCES connected_databases(id),
+    status         TEXT    NOT NULL DEFAULT 'pending',
+    progress       INTEGER NOT NULL DEFAULT 0,    -- 0-100 percent
+    stop_requested INTEGER NOT NULL DEFAULT 0,    -- BOOLEAN: 1 = stop after next batch
+    current_table  TEXT    DEFAULT NULL,
+    started_at     TEXT    DEFAULT NULL,
+    finished_at    TEXT    DEFAULT NULL,
+    error_msg      TEXT    DEFAULT NULL,
+    created_at     TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_jobs_db_id  ON sync_jobs(database_id);
+CREATE INDEX IF NOT EXISTS idx_sync_jobs_status ON sync_jobs(status);
+
+-- ─── sync_checkpoints (resume after crash or graceful stop) ──────────────────
+--
+-- Saved after every batch.  If a sync crashes or is stopped, the next run
+-- resumes from last_processed_id / last_processed_updated_at instead of
+-- restarting from row 0.
+--
+-- UNIQUE(database_id, table_name) ensures one checkpoint per (db, table) pair.
+CREATE TABLE IF NOT EXISTS sync_checkpoints (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    database_id               INTEGER NOT NULL,
+    table_name                TEXT    NOT NULL,
+    last_processed_id         INTEGER NOT NULL DEFAULT 0,
+    last_processed_updated_at TEXT    DEFAULT NULL,
+    updated_at                TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(database_id, table_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_ckpt_db_table ON sync_checkpoints(database_id, table_name);
+
+-- ─── product_metrics (lightweight sales aggregation — replaces transaction sync) ─
+--
+-- Instead of syncing millions of transaction / transaction_sell_lines rows,
+-- a single aggregate query computes per-product sales stats and stores them
+-- here.  This table is the data source for the popularity_score signal in
+-- the composite search ranking formula.
+--
+-- UNIQUE(product_id, source_db_id) supports data from multiple ERP databases
+-- without collision — each source keeps its own metrics rows.
+CREATE TABLE IF NOT EXISTS product_metrics (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id       INTEGER NOT NULL,
+    source_db_id     INTEGER NOT NULL DEFAULT 1,
+    sales_count      INTEGER NOT NULL DEFAULT 0,
+    popularity_score REAL    NOT NULL DEFAULT 0.0,  -- normalised 0.0–1.0
+    last_sold_at     TEXT    DEFAULT NULL,
+    updated_at       TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(product_id, source_db_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_metrics_pid   ON product_metrics(product_id);
+CREATE INDEX IF NOT EXISTS idx_product_metrics_score ON product_metrics(popularity_score);
