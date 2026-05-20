@@ -5,3 +5,13 @@ __pycache__/
 fuzzy_search_app/db_settings.json
 *.db-wal
 *.db-shm
+# Database
+db/local.db
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Environment
+.env
