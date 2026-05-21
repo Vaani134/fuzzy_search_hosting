@@ -10,49 +10,75 @@ Architecture overview
   sync_checkpoints      — one row per (database, table); enables crash-resume
   product_metrics       — aggregated sales stats; replaces full transaction sync
 
+Sub-modules used
+================
+  sync_normalization  — per-table row cleaners; converts NULL → safe defaults
+  sync_errors         — persists row-level failures to sync_errors table
+  sync_live_logs      — in-memory ring-buffer log stream per database
+  sync_checkpoints    — SQLite checkpoint CRUD with per-table status tracking
+
 Sync modes
 ==========
-  full=True   Deletes this source's existing rows, then re-imports everything.
-  full=False  Incremental: only rows whose updated_at > last_sync_at are fetched.
-  full=None   Auto-detect: full if the database has never been synced, else incremental.
+  full=True   Deletes this source's existing rows then re-imports everything.
+  full=False  Incremental: dual-key cursor covers rows newer than last_sync_at.
+  full=None   Auto-detect: full on first ever sync, incremental thereafter.
 
-Batch / cursor strategy
-=======================
-  Uses WHERE id > last_id ORDER BY id LIMIT BATCH_SIZE (cursor-based pagination).
-  A fresh MySQL connection is opened per batch to prevent idle-timeout errors.
-  SQLite is committed after every batch so partial progress survives a crash.
-  Checkpoint is updated after each commit so a resumed sync skips processed rows.
+Enterprise incremental cursor
+=============================
+  Single-column cursor (WHERE id > last_id) misses rows that share an
+  updated_at boundary with the resume point.  This engine uses a dual-key
+  cursor that is both safe and gap-free:
+
+    WHERE (updated_at > %s OR (updated_at = %s AND id > %s))
+    ORDER BY updated_at, id
+    LIMIT BATCH_SIZE
+
+  The cursor advances by recording (updated_at, id) from the last row of
+  every batch.  A fresh MySQL connection is opened per batch to prevent
+  WinError 10054 idle-timeout disconnects on long syncs.
+
+Row-level error isolation
+=========================
+  Rows are upserted one at a time inside try/except blocks.  A single bad
+  row (NULL in a NOT NULL column, type mismatch, FK violation) is logged
+  to sync_errors and skipped — it never aborts the batch or the sync run.
 
 Stop mechanism
 ==============
   POST /api/database/<id>/stop  sets stop_requested = 1 in sync_jobs.
-  The sync loop calls _is_stop_requested() after every batch.
+  The sync loop calls _is_stop_requested() before every batch.
   When stop is detected the current checkpoint is saved and the loop exits.
   The thread terminates naturally — no force-kill, no orphaned connections.
 
 Index rebuild
 =============
-  The in-memory FuzzySearchEngine is rebuilt ONLY after a SUCCESSFUL full-sync
-  completion.  Partial, failed, and incremental syncs do NOT trigger a rebuild
-  to avoid exposing incomplete data to live search queries.
-
-WAL mode
-========
-  Enabled in db/database.py's get_connection() — all connections inherit it.
-  Reduces lock contention during concurrent sync + search + analytics writes.
+  The in-memory FuzzySearchEngine is rebuilt ONLY after a SUCCESSFUL full
+  sync completion.  Partial, failed, and incremental syncs do NOT trigger a
+  rebuild to avoid exposing incomplete data to live search queries.
 """
 
+import copy
 import sqlite3
 import threading
-import copy
 import sys
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import SYNC_BATCH_SIZE
 from db.database import get_connection
+
+# Sub-module imports
+from modules.sync_normalization import normalize_row
+from modules.sync_errors import log_row_error, get_recent_errors, get_error_count
+from modules.sync_live_logs import append_log, get_logs, clear_logs
+from modules.sync_checkpoints import (
+    get_checkpoint,
+    save_checkpoint,
+    clear_checkpoints,
+    get_all_checkpoints,
+)
 
 try:
     import pymysql
@@ -65,7 +91,7 @@ except ImportError:
 CORE_SYNC_TABLES = ["brands", "categories", "product_group", "products"]
 
 # ── Columns fetched from MySQL per table (must match SQLite schema exactly) ────
-TABLE_COLUMNS = {
+TABLE_COLUMNS: Dict[str, list] = {
     "brands": [
         "id", "business_id", "name", "description",
         "created_by", "deleted_at", "created_at", "updated_at",
@@ -90,15 +116,38 @@ TABLE_COLUMNS = {
         "out_of_stock", "aisle", "rack", "shelf", "bin",
         "qty_box", "case_qty", "master_case_qty", "ml",
         "product_group_id", "group_variation_name", "note",
-        "created_by", "created_at", "updated_at", "synced_at",
+        "created_by", "created_at", "updated_at",
+        # synced_at is NOT in TABLE_COLUMNS — it's injected by _upsert_row()
     ],
 }
 
 
 # ── Live state (in-memory, per database_id) ────────────────────────────────────
-# Provides real-time progress for the polling frontend without a DB round-trip.
-_state_lock = threading.Lock()
-_live_states: dict = {}   # {db_id: {...}}
+_state_lock  = threading.Lock()
+_live_states: dict = {}
+_ID_SCOPE_MULTIPLIER = 1_000_000_000
+
+
+def _scoped_id(source_db_id: int, source_id: Optional[int]) -> int:
+    """Map source-local integer IDs into a globally unique SQLite ID space."""
+    if source_id is None:
+        raise ValueError("Cannot scope a null source id.")
+    return int(source_db_id) * _ID_SCOPE_MULTIPLIER + int(source_id)
+
+
+def _scope_foreign_keys(table: str, clean_row: dict, source_db_id: int) -> dict:
+    """
+    Rewrite PK/FK IDs so each connected database has isolated key-space.
+    """
+    scoped = dict(clean_row)
+    if scoped.get("id") is not None:
+        scoped["id"] = _scoped_id(source_db_id, scoped["id"])
+
+    if table == "products":
+        for fk_col in ("brand_id", "category_id", "sub_category_id", "product_group_id"):
+            if scoped.get(fk_col) is not None:
+                scoped[fk_col] = _scoped_id(source_db_id, scoped[fk_col])
+    return scoped
 
 
 def _init_live_state(db_id: int, mode: str, job_id: int) -> None:
@@ -110,9 +159,20 @@ def _init_live_state(db_id: int, mode: str, job_id: int) -> None:
             "finished_at": None,
             "mode":        mode,
             "job_id":      job_id,
+            "rows_synced": 0,
+            "rows_skipped": 0,
+            "rows_error":  0,
             "tables": {
-                t: {"status": "pending", "rows": 0, "error": None,
-                    "started_at": None, "finished_at": None}
+                t: {
+                    "status":      "pending",
+                    "rows_synced": 0,
+                    "rows_skipped": 0,
+                    "rows_error":  0,
+                    "batch_count": 0,
+                    "error":       None,
+                    "started_at":  None,
+                    "finished_at": None,
+                }
                 for t in CORE_SYNC_TABLES + ["product_metrics"]
             },
         }
@@ -126,11 +186,22 @@ def _update_live_state(db_id: int, **kwargs) -> None:
 
 def _update_table_live(db_id: int, table: str, **kwargs) -> None:
     with _state_lock:
-        state = _live_states.get(db_id, {})
+        state  = _live_states.get(db_id, {})
         tables = state.setdefault("tables", {})
         if table not in tables:
-            tables[table] = {"status": "pending", "rows": 0, "error": None}
+            tables[table] = {
+                "status": "pending", "rows_synced": 0,
+                "rows_skipped": 0, "rows_error": 0,
+                "batch_count": 0, "error": None,
+                "started_at": None, "finished_at": None,
+            }
         tables[table].update(kwargs)
+        # Propagate totals to top-level counters
+        totals = {"rows_synced": 0, "rows_skipped": 0, "rows_error": 0}
+        for t in tables.values():
+            for key in totals:
+                totals[key] += t.get(key, 0)
+        state.update(totals)
 
 
 def get_live_state(db_id: int) -> dict:
@@ -165,30 +236,14 @@ def _open_mysql(cfg: dict):
     )
 
 
-def _sanitize(value):
-    """Convert MySQL-specific types to SQLite-safe equivalents."""
-    import decimal
-    import datetime as _dt
-    if isinstance(value, decimal.Decimal):
-        return float(value)
-    if isinstance(value, (_dt.datetime, _dt.date)):
-        return value.isoformat()
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
-
-
 # ── Sync job management ────────────────────────────────────────────────────────
 
 def _create_job(db_id: int) -> int:
-    """Insert a pending sync_jobs row. Returns the new job id."""
+    """Insert a pending sync_jobs row.  Returns the new job id."""
     conn = get_connection()
     try:
         cur = conn.execute(
-            """
-            INSERT INTO sync_jobs (database_id, status, created_at)
-            VALUES (?, 'pending', ?)
-            """,
+            "INSERT INTO sync_jobs (database_id, status, created_at) VALUES (?, 'pending', ?)",
             (db_id, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
@@ -214,10 +269,7 @@ def _update_job(job_id: int, **fields) -> None:
 
 
 def _is_stop_requested(job_id: int) -> bool:
-    """
-    Check whether the API has requested a graceful stop for this job.
-    Called after every batch — no force-kill is ever needed.
-    """
+    """Check whether the API has requested a graceful stop for this job."""
     conn = get_connection()
     try:
         row = conn.execute(
@@ -233,11 +285,8 @@ def get_active_job(db_id: int) -> Optional[dict]:
     conn = get_connection()
     try:
         row = conn.execute(
-            """
-            SELECT * FROM sync_jobs
-            WHERE database_id = ? AND status = 'running'
-            ORDER BY id DESC LIMIT 1
-            """,
+            "SELECT * FROM sync_jobs WHERE database_id = ? AND status = 'running' "
+            "ORDER BY id DESC LIMIT 1",
             (db_id,),
         ).fetchone()
         return dict(row) if row else None
@@ -249,7 +298,6 @@ def request_stop(db_id: int) -> dict:
     """
     Request a graceful stop for the running sync on this database.
     Sets stop_requested = 1 — the sync loop will exit after its current batch.
-    Returns {"ok": bool, "message": str}.
     """
     job = get_active_job(db_id)
     if not job:
@@ -267,121 +315,6 @@ def request_stop(db_id: int) -> dict:
     return {"ok": True, "message": f"Stop requested for sync job {job['id']}."}
 
 
-# ── Checkpoint management ──────────────────────────────────────────────────────
-
-def _get_checkpoint(db_id: int, table: str) -> Optional[dict]:
-    """Load the checkpoint for (db_id, table). Returns None when absent."""
-    conn = get_connection()
-    try:
-        row = conn.execute(
-            """
-            SELECT * FROM sync_checkpoints
-            WHERE database_id = ? AND table_name = ?
-            """,
-            (db_id, table),
-        ).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-def _save_checkpoint(
-    db_id: int,
-    table: str,
-    last_id: int,
-    last_updated_at: Optional[str] = None,
-) -> None:
-    """
-    Upsert a checkpoint for (db_id, table).
-    Called after every committed batch so a crash or stop can resume cleanly.
-    """
-    conn = get_connection()
-    try:
-        conn.execute(
-            """
-            INSERT INTO sync_checkpoints
-                (database_id, table_name, last_processed_id,
-                 last_processed_updated_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(database_id, table_name) DO UPDATE SET
-                last_processed_id         = excluded.last_processed_id,
-                last_processed_updated_at = excluded.last_processed_updated_at,
-                updated_at                = excluded.updated_at
-            """,
-            (db_id, table, last_id, last_updated_at,
-             datetime.now(timezone.utc).isoformat()),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _clear_checkpoints(db_id: int) -> None:
-    """Remove all checkpoints for a database. Called at the start of a full sync."""
-    conn = get_connection()
-    try:
-        conn.execute(
-            "DELETE FROM sync_checkpoints WHERE database_id = ?", (db_id,)
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# ── SQLite UPSERT helper ───────────────────────────────────────────────────────
-
-def _upsert_batch(
-    sqlite_conn: sqlite3.Connection,
-    table: str,
-    rows: list,
-    source_db_id: int,
-) -> int:
-    """
-    Insert-or-update a batch of rows into a synced table.
-
-    Includes source_db_id so every row is traceable to its ERP source.
-    Conflict is resolved on the primary key (id) — all other columns including
-    source_db_id are updated.  This means syncing from a second ERP will
-    overwrite a row with the same MySQL id from the first ERP; operators are
-    responsible for ensuring non-overlapping id spaces across ERPs.
-
-    The synced_at column (products only) is set to the current UTC time
-    on every upsert so we know exactly when the local cache was last refreshed.
-    """
-    if not rows:
-        return 0
-
-    cols = list(TABLE_COLUMNS[table])
-    now  = datetime.now(timezone.utc).isoformat()
-
-    # Replace synced_at with wall-clock time instead of the MySQL value
-    if "synced_at" in cols:
-        synced_idx = cols.index("synced_at")
-
-    all_cols     = cols + ["source_db_id"]
-    placeholders = ", ".join("?" * len(all_cols))
-    col_names    = ", ".join(all_cols)
-
-    update_cols  = [c for c in all_cols if c != "id"]
-    update_clause = ", ".join(f"{c} = excluded.{c}" for c in update_cols)
-
-    sql = (
-        f"INSERT INTO {table} ({col_names}) VALUES ({placeholders}) "
-        f"ON CONFLICT(id) DO UPDATE SET {update_clause}"
-    )
-
-    data = []
-    for row in rows:
-        values = list(_sanitize(row.get(c)) for c in cols)
-        if "synced_at" in cols:
-            values[synced_idx] = now
-        values.append(source_db_id)
-        data.append(tuple(values))
-
-    sqlite_conn.executemany(sql, data)
-    return len(data)
-
-
 # ── Sync log helper ────────────────────────────────────────────────────────────
 
 def _log_sync(
@@ -393,13 +326,95 @@ def _log_sync(
 ) -> None:
     """Append one row to sync_log (used by the existing history endpoint)."""
     sqlite_conn.execute(
-        """
-        INSERT INTO sync_log
-            (table_name, last_synced, records_synced, status, error_msg)
-        VALUES (?, ?, ?, ?, ?)
-        """,
+        "INSERT INTO sync_log (table_name, last_synced, records_synced, status, error_msg) "
+        "VALUES (?, ?, ?, ?, ?)",
         (table, datetime.now(timezone.utc).isoformat(), count, status, error),
     )
+
+
+# ── Row-level upsert ───────────────────────────────────────────────────────────
+
+def _upsert_row(
+    sqlite_conn: sqlite3.Connection,
+    table: str,
+    clean_row: dict,
+    source_db_id: int,
+    now: str,
+) -> None:
+    """
+    Insert-or-update a single pre-normalized row.
+
+    Includes source_db_id and (for products) synced_at set to wall-clock time.
+    Raises on SQLite error — caller is responsible for catching per-row.
+    """
+    cols = list(TABLE_COLUMNS[table])
+
+    # For products inject synced_at at write time (not from ERP)
+    extra_cols: list = ["source_db_id"]
+    extra_vals: list = [source_db_id]
+    if table == "products":
+        extra_cols.append("synced_at")
+        extra_vals.append(now)
+
+    all_cols      = cols + extra_cols
+    placeholders  = ", ".join("?" * len(all_cols))
+    col_names     = ", ".join(all_cols)
+    update_cols   = [c for c in all_cols if c != "id"]
+    update_clause = ", ".join(f"{c} = excluded.{c}" for c in update_cols)
+
+    sql = (
+        f"INSERT INTO {table} ({col_names}) VALUES ({placeholders}) "
+        f"ON CONFLICT(id) DO UPDATE SET {update_clause}"
+    )
+
+    clean_row = _scope_foreign_keys(table, clean_row, source_db_id)
+    values = [clean_row.get(c) for c in cols] + extra_vals
+    sqlite_conn.execute(sql, values)
+
+
+def _upsert_batch_isolated(
+    db_id: int,
+    sqlite_conn: sqlite3.Connection,
+    table: str,
+    raw_rows: list,
+    source_db_id: int,
+) -> Tuple[int, int, int]:
+    """
+    Upsert a batch of raw MySQL rows with full row-level error isolation.
+
+    Each row is:
+      1. Normalized via normalize_row() (NULL-safe, type-safe).
+      2. Upserted individually inside try/except.
+      3. On failure: logged to sync_errors, counted as skipped.
+
+    Returns (synced, skipped, errors) counts.
+    """
+    synced = skipped = errors = 0
+    now    = datetime.now(timezone.utc).isoformat()
+
+    for raw_row in raw_rows:
+        source_id = raw_row.get("id")
+        try:
+            clean = normalize_row(table, raw_row)
+            if clean is None:
+                # normalize_row() returned None — already printed traceback
+                skipped += 1
+                log_row_error(
+                    db_id, table, source_id,
+                    ValueError("normalize_row returned None"),
+                    raw_row,
+                )
+                continue
+
+            _upsert_row(sqlite_conn, table, clean, source_db_id, now)
+            synced += 1
+
+        except Exception as exc:
+            errors  += 1
+            skipped += 1
+            log_row_error(db_id, table, source_id, exc, raw_row)
+
+    return synced, skipped, errors
 
 
 # ── Single-table sync ──────────────────────────────────────────────────────────
@@ -414,44 +429,50 @@ def _sync_table(
     checkpoint: Optional[dict],
 ) -> dict:
     """
-    Sync one MySQL table into SQLite using cursor-based pagination.
+    Sync one MySQL table into SQLite using a dual-key enterprise cursor.
 
-    Cursor strategy:
-      WHERE id > last_id ORDER BY id LIMIT BATCH_SIZE
-      → O(batch_size) per fetch regardless of table position, no LIMIT/OFFSET skew.
-      → Fresh MySQL connection per batch prevents idle-timeout (WinError 10054).
+    Cursor strategy (enterprise incremental):
+      ORDER BY updated_at, id — stable deterministic ordering.
+      WHERE (updated_at > %s OR (updated_at = %s AND id > %s))
+      → gap-free even when multiple rows share the same updated_at value.
+      → Fresh MySQL connection per batch to prevent WinError 10054.
 
-    Incremental filter (full=False):
-      WHERE updated_at >= since AND id > last_id
-      → Only rows changed since the last successful sync are transferred.
+    For full sync the cursor degenerates to WHERE id > %s ORDER BY id
+    because we don't need updated_at filtering.
+
+    Row-level isolation:
+      Each row is upserted inside try/except via _upsert_batch_isolated().
+      One bad row never aborts the batch; it is logged to sync_errors.
 
     Checkpoint:
       Saved after every committed batch.  If the job is stopped mid-table
-      the next run resumes from last_processed_id rather than row 0.
-
-    Returns a result dict consumed by sync_database().
+      the next run resumes from last_processed_id / last_processed_updated_at.
     """
-    result = {
-        "table":       table,
-        "rows_synced": 0,
-        "status":      "ok",
-        "error":       None,
+    result: dict = {
+        "table":        table,
+        "rows_synced":  0,
+        "rows_skipped": 0,
+        "rows_error":   0,
+        "batch_count":  0,
+        "status":       "ok",
+        "error":        None,
     }
-    sqlite_conn = None
+    sqlite_conn     = None
+    last_id         = 0      # safe defaults so except block can always reference them
+    last_updated_at = None
+    table_start     = datetime.now(timezone.utc)
 
     _update_table_live(db_id, table, status="running",
-                       started_at=datetime.now(timezone.utc).isoformat())
+                       started_at=table_start.isoformat())
+    append_log(db_id, "INFO",
+               f"[{table}] Starting {'full' if full else 'incremental'} sync",
+               table=table)
 
     try:
         sqlite_conn = get_connection()
         sqlite_conn.execute("PRAGMA foreign_keys = OFF")
 
-        cols     = TABLE_COLUMNS[table]
-        col_list = ", ".join(f"`{c}`" for c in cols)
-
         # ── Full sync: wipe this source's rows before reimporting ─────────────
-        # We only delete rows belonging to this source_db_id so data from
-        # other connected databases is never affected.
         if full:
             sqlite_conn.execute(
                 f"DELETE FROM {table} WHERE source_db_id = ?", (db_id,)
@@ -459,41 +480,66 @@ def _sync_table(
             sqlite_conn.commit()
             last_id         = 0
             last_updated_at = None
+            append_log(db_id, "INFO",
+                       f"[{table}] Full sync: deleted existing rows for source_db_id={db_id}",
+                       table=table)
         else:
-            # Incremental: resume from checkpoint if one exists, else use
-            # last_sync_at from the connected_databases row as the floor.
-            if checkpoint:
+            if checkpoint and checkpoint["last_processed_id"]:
                 last_id         = checkpoint["last_processed_id"]
                 last_updated_at = checkpoint["last_processed_updated_at"]
+                append_log(db_id, "INFO",
+                           f"[{table}] Resuming from checkpoint id={last_id} "
+                           f"updated_at={last_updated_at}",
+                           table=table)
             else:
                 last_id         = 0
                 last_updated_at = since
+                append_log(db_id, "INFO",
+                           f"[{table}] Incremental sync since={since}",
+                           table=table)
 
-        total = 0
+        cols     = TABLE_COLUMNS[table]
+        col_list = ", ".join(f"`{c}`" for c in cols)
+        total_synced = total_skipped = total_errors = batch_num = 0
+
+        # Mark checkpoint as running so a crash mid-table is visible
+        save_checkpoint(db_id, table, last_id, last_updated_at, status="running")
 
         while True:
-            # ── Stop check (before each batch) ────────────────────────────────
-            # Never force-kills the thread — just exits the loop cleanly.
+            # ── Stop check ────────────────────────────────────────────────────
             if _is_stop_requested(job_id):
-                _save_checkpoint(db_id, table, last_id, last_updated_at)
+                save_checkpoint(db_id, table, last_id, last_updated_at,
+                                status="stopped")
+                append_log(db_id, "WARNING",
+                           f"[{table}] Stop requested — halting after batch {batch_num}",
+                           table=table)
                 result["status"] = "stopped"
                 _update_table_live(
-                    db_id, table, status="stopped", rows=total,
+                    db_id, table, status="stopped",
+                    rows_synced=total_synced, rows_skipped=total_skipped,
+                    rows_error=total_errors, batch_count=batch_num,
                     finished_at=datetime.now(timezone.utc).isoformat(),
                 )
                 return result
 
             # ── Build MySQL query ──────────────────────────────────────────────
-            # Incremental filter on updated_at only when we have a reference time
-            # AND we are not doing a full sync.
-            if since and not full:
+            if full:
+                # Full sync: simple id cursor, ORDER BY id
                 query = (
                     f"SELECT {col_list} FROM `{table}` "
-                    f"WHERE updated_at >= %s AND id > %s "
-                    f"ORDER BY id LIMIT %s"
+                    f"WHERE id > %s ORDER BY id LIMIT %s"
                 )
-                params = (since, last_id, SYNC_BATCH_SIZE)
+                params = (last_id, SYNC_BATCH_SIZE)
+            elif last_updated_at:
+                # Enterprise dual-key cursor: no-gap incremental
+                query = (
+                    f"SELECT {col_list} FROM `{table}` "
+                    f"WHERE (updated_at > %s OR (updated_at = %s AND id > %s)) "
+                    f"ORDER BY updated_at, id LIMIT %s"
+                )
+                params = (last_updated_at, last_updated_at, last_id, SYNC_BATCH_SIZE)
             else:
+                # Incremental but no since timestamp — fall back to full cursor
                 query = (
                     f"SELECT {col_list} FROM `{table}` "
                     f"WHERE id > %s ORDER BY id LIMIT %s"
@@ -510,51 +556,81 @@ def _sync_table(
                 mysql_conn.close()
 
             if not rows:
-                break   # no more data for this table
+                break
 
-            # ── Upsert into SQLite ─────────────────────────────────────────────
-            count = _upsert_batch(sqlite_conn, table, rows, source_db_id=db_id)
-            total += count
+            batch_num += 1
 
-            # Advance cursor to the highest id in this batch
-            last_id         = rows[-1]["id"]
-            last_updated_at = rows[-1].get("updated_at")
+            # ── Row-level isolated upsert ──────────────────────────────────────
+            synced, skipped, errors = _upsert_batch_isolated(
+                db_id, sqlite_conn, table, rows, source_db_id=db_id
+            )
+            total_synced  += synced
+            total_skipped += skipped
+            total_errors  += errors
 
-            # ── Commit batch + save checkpoint ─────────────────────────────────
-            # Committing here means a crash loses at most one batch of work.
+            # Advance dual-key cursor from last row
+            last_row        = rows[-1]
+            last_id         = last_row["id"]
+            last_updated_at = last_row.get("updated_at")
+
+            # ── Commit + save checkpoint ───────────────────────────────────────
             sqlite_conn.commit()
-            _save_checkpoint(db_id, table, last_id, last_updated_at)
+            save_checkpoint(db_id, table, last_id, last_updated_at,
+                            status="running")
 
-            _update_table_live(db_id, table, rows=total)
+            _update_table_live(
+                db_id, table,
+                rows_synced=total_synced, rows_skipped=total_skipped,
+                rows_error=total_errors, batch_count=batch_num,
+            )
             _update_job(job_id, current_table=table)
 
-            print(f"  [DB {db_id}][{table}] batch committed — {total} rows "
-                  f"(cursor id={last_id})")
+            elapsed = (datetime.now(timezone.utc) - table_start).seconds
+            append_log(db_id, "DEBUG",
+                       f"[{table}] Batch {batch_num}: "
+                       f"+{synced} synced, {skipped} skipped, {errors} errors "
+                       f"| total={total_synced} | cursor id={last_id} "
+                       f"| elapsed={elapsed}s",
+                       table=table, batch=batch_num)
 
         # ── Table complete ─────────────────────────────────────────────────────
-        _log_sync(sqlite_conn, table, total, "ok")
+        _log_sync(sqlite_conn, table, total_synced, "ok")
         sqlite_conn.commit()
+        save_checkpoint(db_id, table, last_id, last_updated_at, status="completed")
 
-        result["rows_synced"] = total
+        elapsed = (datetime.now(timezone.utc) - table_start).seconds
+        result.update(rows_synced=total_synced, rows_skipped=total_skipped,
+                      rows_error=total_errors, batch_count=batch_num)
+
         _update_table_live(
-            db_id, table, status="ok", rows=total,
+            db_id, table, status="ok",
+            rows_synced=total_synced, rows_skipped=total_skipped,
+            rows_error=total_errors, batch_count=batch_num,
             finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+        append_log(
+            db_id, "INFO",
+            f"[{table}] Done: {total_synced} synced, {total_skipped} skipped, "
+            f"{total_errors} errors, {batch_num} batches, {elapsed}s elapsed",
+            table=table,
         )
 
     except Exception as exc:
         result["status"] = "error"
         result["error"]  = str(exc)
+        save_checkpoint(db_id, table, last_id, last_updated_at, status="failed")
         _update_table_live(
             db_id, table, status="error", error=str(exc),
             finished_at=datetime.now(timezone.utc).isoformat(),
         )
+        append_log(db_id, "ERROR", f"[{table}] FATAL: {exc}", table=table)
         if sqlite_conn:
             try:
-                _log_sync(sqlite_conn, table, result["rows_synced"], "error", str(exc))
+                _log_sync(sqlite_conn, table, result.get("rows_synced", 0),
+                          "error", str(exc))
                 sqlite_conn.commit()
             except Exception:
                 pass
-        print(f"  [DB {db_id}][ERROR] {table}: {exc}")
 
     finally:
         if sqlite_conn:
@@ -573,34 +649,34 @@ def _sync_product_metrics(mysql_cfg: dict, db_id: int, job_id: int) -> dict:
     """
     Aggregate per-product sales metrics from MySQL in one query.
 
-    This replaces the expensive full sync of transactions +
-    transaction_sell_lines (which can be millions of rows).
-    Instead we fetch only the aggregated summary per product.
-
-    Metrics stored:
-      sales_count      — number of finalised sell transactions containing this product
-      popularity_score — normalised total quantity sold (0.0–1.0 within this source)
-      last_sold_at     — date of the most recent completed sale
-
-    The aggregate query runs on the MySQL side (uses its indexes).
-    Results are upserted into product_metrics with ON CONFLICT on
-    (product_id, source_db_id) so multiple ERP sources never collide.
+    Replaces the expensive full sync of transactions + transaction_sell_lines.
+    Metrics (sales_count, popularity_score, last_sold_at) are upserted into
+    product_metrics with ON CONFLICT on (product_id, source_db_id).
     """
-    result = {
-        "table":       "product_metrics",
-        "rows_synced": 0,
-        "status":      "ok",
-        "error":       None,
+    result: dict = {
+        "table":        "product_metrics",
+        "rows_synced":  0,
+        "rows_skipped": 0,
+        "rows_error":   0,
+        "batch_count":  1,
+        "status":       "ok",
+        "error":        None,
     }
+    start = datetime.now(timezone.utc)
 
     _update_table_live(db_id, "product_metrics", status="running",
-                       started_at=datetime.now(timezone.utc).isoformat())
+                       started_at=start.isoformat())
+    append_log(db_id, "INFO", "[product_metrics] Starting aggregation query",
+               table="product_metrics")
 
     try:
         if _is_stop_requested(job_id):
             result["status"] = "stopped"
             _update_table_live(db_id, "product_metrics", status="stopped",
                                finished_at=datetime.now(timezone.utc).isoformat())
+            append_log(db_id, "WARNING",
+                       "[product_metrics] Skipped — stop requested",
+                       table="product_metrics")
             return result
 
         mysql_conn = _open_mysql(mysql_cfg)
@@ -625,66 +701,104 @@ def _sync_product_metrics(mysql_cfg: dict, db_id: int, job_id: int) -> dict:
         finally:
             mysql_conn.close()
 
+        append_log(db_id, "INFO",
+                   f"[product_metrics] Aggregation returned {len(rows)} products",
+                   table="product_metrics")
+
         if not rows:
-            _update_table_live(db_id, "product_metrics", status="ok", rows=0,
+            _update_table_live(db_id, "product_metrics", status="ok", rows_synced=0,
                                finished_at=datetime.now(timezone.utc).isoformat())
             return result
 
-        # Normalise popularity_score to 0.0–1.0 within this source
         max_qty = max(float(r.get("total_qty") or 0) for r in rows) or 1.0
         now     = datetime.now(timezone.utc).isoformat()
-
-        data = [
-            (
-                int(r["product_id"]),
-                db_id,
-                int(r.get("sales_count") or 0),
-                round(float(r.get("total_qty") or 0) / max_qty, 4),
-                _sanitize(r.get("last_sold_at")),
-                now,
-            )
-            for r in rows
-        ]
+        synced = skipped = errors = 0
 
         sqlite_conn = get_connection()
         try:
-            sqlite_conn.executemany(
-                """
-                INSERT INTO product_metrics
-                    (product_id, source_db_id, sales_count,
-                     popularity_score, last_sold_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(product_id, source_db_id) DO UPDATE SET
-                    sales_count      = excluded.sales_count,
-                    popularity_score = excluded.popularity_score,
-                    last_sold_at     = excluded.last_sold_at,
-                    updated_at       = excluded.updated_at
-                """,
-                data,
-            )
+            for r in rows:
+                try:
+                    pid       = _scoped_id(db_id, int(r["product_id"]))
+                    s_count   = int(r.get("sales_count") or 0)
+                    pop_score = round(float(r.get("total_qty") or 0) / max_qty, 4)
+                    last_sold = r.get("last_sold_at")
+                    if hasattr(last_sold, "isoformat"):
+                        last_sold = last_sold.isoformat()
+
+                    sqlite_conn.execute(
+                        """
+                        INSERT INTO product_metrics
+                            (product_id, source_db_id, sales_count,
+                             popularity_score, last_sold_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(product_id, source_db_id) DO UPDATE SET
+                            sales_count      = excluded.sales_count,
+                            popularity_score = excluded.popularity_score,
+                            last_sold_at     = excluded.last_sold_at,
+                            updated_at       = excluded.updated_at
+                        """,
+                        (pid, db_id, s_count, pop_score, last_sold, now),
+                    )
+                    synced += 1
+                except Exception as exc:
+                    errors  += 1
+                    skipped += 1
+                    log_row_error(db_id, "product_metrics",
+                                  r.get("product_id"), exc, dict(r))
+
             sqlite_conn.commit()
         finally:
             sqlite_conn.close()
 
-        result["rows_synced"] = len(data)
+        elapsed = (datetime.now(timezone.utc) - start).seconds
+        result.update(rows_synced=synced, rows_skipped=skipped, rows_error=errors)
         _update_table_live(
-            db_id, "product_metrics", status="ok", rows=len(data),
+            db_id, "product_metrics", status="ok",
+            rows_synced=synced, rows_skipped=skipped, rows_error=errors,
             finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+        append_log(
+            db_id, "INFO",
+            f"[product_metrics] Done: {synced} upserted, {skipped} skipped, "
+            f"{errors} errors, {elapsed}s elapsed",
+            table="product_metrics",
         )
 
     except Exception as exc:
         result["status"] = "error"
         result["error"]  = str(exc)
-        _update_table_live(
-            db_id, "product_metrics", status="error", error=str(exc),
-            finished_at=datetime.now(timezone.utc).isoformat(),
-        )
-        print(f"  [DB {db_id}][ERROR] product_metrics: {exc}")
+        _update_table_live(db_id, "product_metrics", status="error", error=str(exc),
+                           finished_at=datetime.now(timezone.utc).isoformat())
+        append_log(db_id, "ERROR",
+                   f"[product_metrics] FATAL: {exc}", table="product_metrics")
 
     return result
 
 
 # ── Main entry points ──────────────────────────────────────────────────────────
+
+def _check_is_resuming(db_id: int) -> bool:
+    """
+    Return True when the last sync job for *db_id* ended in 'stopped' or 'failed'.
+
+    This distinguishes a crash/stop-resume from a fresh incremental:
+      - stopped / failed  → resume: respect existing checkpoints, skip completed tables
+      - completed / never → fresh:  ignore old checkpoints, run all tables from 'since'
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT status FROM sync_jobs "
+            "WHERE database_id = ? AND status NOT IN ('pending', 'running') "
+            "ORDER BY id DESC LIMIT 1",
+            (db_id,),
+        ).fetchone()
+        return bool(row and row["status"] in ("stopped", "failed"))
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
 
 def sync_database(db_id: int, full: bool = None) -> dict:
     """
@@ -715,7 +829,6 @@ def sync_database(db_id: int, full: bool = None) -> dict:
             "Use POST /api/database/<id>/stop to cancel it first."
         )
 
-    # Auto-detect: first-ever sync must be a full sync
     if full is None:
         full = (db["last_sync_at"] is None)
 
@@ -723,6 +836,7 @@ def sync_database(db_id: int, full: bool = None) -> dict:
     since = None if full else db["last_sync_at"]
 
     job_id = _create_job(db_id)
+    clear_logs(db_id)
     _init_live_state(db_id, mode, job_id)
     update_sync_status(db_id, "running")
     _update_job(
@@ -731,31 +845,80 @@ def sync_database(db_id: int, full: bool = None) -> dict:
         started_at=datetime.now(timezone.utc).isoformat(),
     )
 
+    sync_start = datetime.now(timezone.utc)
+    append_log(db_id, "INFO",
+               f"Sync starting | mode={mode} | since={since or 'beginning'} "
+               f"| job_id={job_id}")
     print(f"\n{'='*55}")
     print(f"[DB {db_id}] {mode.upper()} sync starting — {datetime.now()}")
     print(f"  since={since or 'beginning'}  job_id={job_id}")
     print(f"{'='*55}")
 
+    # Determine resume vs fresh before entering the try block
+    _is_resuming = False
+
     try:
         if full:
-            _clear_checkpoints(db_id)   # fresh start — discard old resume points
+            clear_checkpoints(db_id)
+            append_log(db_id, "INFO", "Full sync: checkpoints cleared")
+        else:
+            # Decide whether to resume from checkpoints or start fresh.
+            # Only crash-resume (last job stopped/failed) should use checkpoints.
+            # A fresh incremental after a completed sync must fetch rows from
+            # 'since' — NOT skip tables because their old checkpoint says "completed".
+            _is_resuming = _check_is_resuming(db_id)
+            if _is_resuming:
+                append_log(db_id, "INFO",
+                           "Resuming stopped/failed sync — checkpoints active")
+            else:
+                # Clear stale checkpoints so every table runs from 'since' cursor.
+                clear_checkpoints(db_id)
+                append_log(db_id, "INFO",
+                           f"Fresh incremental sync | since={since or 'beginning'}")
 
-        mysql_cfg  = get_mysql_config(db_id)
+        mysql_cfg    = get_mysql_config(db_id)
         all_results: list = []
 
         for i, table in enumerate(CORE_SYNC_TABLES):
             if _is_stop_requested(job_id):
+                append_log(db_id, "WARNING",
+                           f"Stop requested before {table} — halting.")
                 print(f"  [DB {db_id}] Stop requested before {table} — halting.")
                 break
 
-            # Progress: 0–90% spread across core tables; 90–100% for metrics
             _update_job(
                 job_id,
                 current_table=table,
                 progress=int(i / len(CORE_SYNC_TABLES) * 90),
             )
 
-            checkpoint = None if full else _get_checkpoint(db_id, table)
+            # Load checkpoint only when genuinely resuming a stopped/failed run.
+            # For full sync or fresh incremental, ckpt=None forces _sync_table to
+            # use the row-0 / 'since' cursor rather than an old checkpoint position.
+            ckpt = get_checkpoint(db_id, table) if _is_resuming else None
+
+            # Skip already-completed tables ONLY during crash-resume.
+            # A fresh incremental must run every table even if old checkpoints say done.
+            if _is_resuming and ckpt and ckpt.get("status") == "completed":
+                now_ts = datetime.now(timezone.utc).isoformat()
+                append_log(db_id, "INFO",
+                           f"[{table}] Already completed in previous run — skipping",
+                           table=table)
+                all_results.append({
+                    "table": table, "rows_synced": 0,
+                    "rows_skipped": 0, "rows_error": 0,
+                    "batch_count": 0, "status": "ok", "error": None,
+                    "skipped_reason": "already_completed",
+                })
+                _update_table_live(
+                    db_id, table,
+                    status="skipped",
+                    rows_synced=0, rows_skipped=0, rows_error=0,
+                    batch_count=0,
+                    started_at=now_ts,
+                    finished_at=now_ts,
+                )
+                continue
 
             res = _sync_table(
                 mysql_cfg=mysql_cfg,
@@ -764,25 +927,24 @@ def sync_database(db_id: int, full: bool = None) -> dict:
                 table=table,
                 full=full,
                 since=since,
-                checkpoint=checkpoint,
+                checkpoint=ckpt,
             )
             all_results.append(res)
 
             icon = {"ok": "✓", "stopped": "⏹", "error": "✗"}.get(res["status"], "?")
             print(f"  {icon} [DB {db_id}][{table}]: "
-                  f"{res['rows_synced']} rows — {res['status']}")
+                  f"{res['rows_synced']} synced, {res.get('rows_error', 0)} errors "
+                  f"— {res['status']}")
 
             if res["status"] in ("stopped", "error"):
-                break   # propagate stop/error without syncing remaining tables
+                break
 
-        # ── Evaluate outcome so far ────────────────────────────────────────────
         was_stopped = (
             any(r["status"] == "stopped" for r in all_results)
             or _is_stop_requested(job_id)
         )
         had_error = any(r["status"] == "error" for r in all_results)
 
-        # ── Product metrics — only when core tables all completed cleanly ──────
         if not was_stopped and not had_error:
             _update_job(job_id, current_table="product_metrics", progress=92)
             metrics = _sync_product_metrics(mysql_cfg, db_id, job_id)
@@ -793,7 +955,6 @@ def sync_database(db_id: int, full: bool = None) -> dict:
             if metrics["status"] == "error":
                 had_error = True
 
-        # ── Recompute final verdict after metrics ──────────────────────────────
         was_stopped = (
             any(r["status"] == "stopped" for r in all_results)
             or _is_stop_requested(job_id)
@@ -801,6 +962,7 @@ def sync_database(db_id: int, full: bool = None) -> dict:
         had_error = any(r["status"] == "error" for r in all_results)
 
         now = datetime.now(timezone.utc).isoformat()
+        elapsed = (datetime.now(timezone.utc) - sync_start).seconds
 
         if was_stopped:
             final = "stopped"
@@ -817,13 +979,23 @@ def sync_database(db_id: int, full: bool = None) -> dict:
 
         _update_live_state(db_id, running=False, finished_at=now)
 
-        print(f"\n[DB {db_id}] Sync {final}.  {'='*38}")
+        total_synced  = sum(r.get("rows_synced", 0) for r in all_results)
+        total_errors  = sum(r.get("rows_error", 0) for r in all_results)
+        total_skipped = sum(r.get("rows_skipped", 0) for r in all_results)
 
-        # ── Rebuild search index after a SUCCESSFUL full sync only ─────────────
-        # Never rebuild on partial, stopped, or incremental syncs to avoid
-        # serving incomplete data to live search queries.
-        if final == "ok" and full:
-            _trigger_index_rebuild()
+        append_log(
+            db_id,
+            "INFO" if final == "ok" else "WARNING",
+            f"Sync {final} | {total_synced} rows synced, "
+            f"{total_skipped} skipped, {total_errors} errors | {elapsed}s total",
+        )
+        print(f"\n[DB {db_id}] Sync {final} — "
+              f"{total_synced} synced, {total_errors} errors, {elapsed}s")
+
+        if final == "ok":
+            _trigger_index_rebuild(db_id)
+            append_log(db_id, "INFO",
+                       "Search indexes rebuilt (db + global) and cache cleared.")
 
         return {"status": final, "db_id": db_id, "tables": all_results}
 
@@ -832,13 +1004,14 @@ def sync_database(db_id: int, full: bool = None) -> dict:
         _update_job(job_id, status="failed", error_msg=str(exc), finished_at=now)
         update_sync_status(db_id, "error")
         _update_live_state(db_id, running=False, finished_at=now)
+        append_log(db_id, "ERROR", f"Sync FAILED: {exc}")
         print(f"\n[DB {db_id}] Sync FAILED: {exc}")
         raise
 
 
 def sync_database_background(
     db_id: int,
-    full: bool = None,
+    full: Optional[bool] = None,
     callback=None,
 ) -> threading.Thread:
     """
@@ -860,21 +1033,18 @@ def sync_database_background(
 
 # ── Index rebuild trigger ──────────────────────────────────────────────────────
 
-def _trigger_index_rebuild() -> None:
-    """
-    Rebuild the in-memory FuzzySearchEngine and clear the search cache
-    after a successful full sync.
-
-    Imported lazily to avoid circular imports — fuzzy_search imports config
-    which does not depend on sync_manager.
-    """
+def _trigger_index_rebuild(db_id: int) -> None:
+    """Rebuild in-memory search engines (isolated + global) and clear cache."""
     try:
-        from modules.fuzzy_search import get_engine
+        from modules.fuzzy_search import get_engine, rebuild_global_index
         from modules.cache import search_cache
-        engine = get_engine()
+        engine = get_engine(source_db_id=db_id)
         engine.rebuild()
+        rebuild_global_index()
         search_cache.clear()
-        print("[sync_manager] Search index rebuilt and cache cleared after full sync.")
+        print(
+            f"[sync_manager] Search indexes rebuilt for db_id={db_id} and global; cache cleared."
+        )
     except Exception as exc:
         print(f"[sync_manager] Index rebuild warning: {exc}")
 
@@ -884,9 +1054,11 @@ def _trigger_index_rebuild() -> None:
 def get_database_status(db_id: int) -> dict:
     """
     Return a combined status dict for one database:
-      live   — in-memory real-time state
-      job    — most recent sync_jobs row
-      tables — latest sync_log entry per table
+      live        — in-memory real-time state
+      last_job    — most recent sync_jobs row
+      table_status — latest sync_log entry per table
+      checkpoints — current sync_checkpoints rows
+      error_count — number of unresolved sync_errors rows
     """
     live = get_live_state(db_id)
 
@@ -902,16 +1074,31 @@ def get_database_status(db_id: int) -> dict:
             SELECT s.*
             FROM sync_log s
             INNER JOIN (
-                SELECT table_name, MAX(id) AS max_id FROM sync_log GROUP BY table_name
+                SELECT table_name, MAX(id) AS max_id
+                FROM sync_log GROUP BY table_name
             ) latest ON s.table_name = latest.table_name AND s.id = latest.max_id
             ORDER BY s.last_synced DESC
             """,
         ).fetchall()
-
-        return {
-            "live":        live,
-            "last_job":    dict(last_job) if last_job else None,
-            "table_status": [dict(r) for r in log_rows],
-        }
     finally:
         conn.close()
+
+    return {
+        "live":         live,
+        "last_job":     dict(last_job) if last_job else None,
+        "table_status": [dict(r) for r in log_rows],
+        "checkpoints":  get_all_checkpoints(db_id),
+        "error_count":  get_error_count(db_id),
+    }
+
+
+# ── Live log / error accessors (called by app.py endpoints) ───────────────────
+
+def get_sync_logs(db_id: int, since_ts: Optional[str] = None) -> list:
+    """Return buffered sync log entries for *db_id*."""
+    return get_logs(db_id, since_ts=since_ts)
+
+
+def get_sync_errors(db_id: int, limit: int = 100) -> list:
+    """Return recent sync_errors rows for *db_id*."""
+    return get_recent_errors(db_id, limit=limit)

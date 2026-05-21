@@ -280,6 +280,7 @@ _SUGGESTION_KEYWORDS: List[str] = [
 # Maximum number of candidates passed to extractOne.
 # Keeps the function fast even when the caller supplies thousands of names.
 _SUGGESTION_POOL_LIMIT = 500
+_ID_SCOPE_MULTIPLIER = 1_000_000_000
 
 
 def get_query_suggestion(
@@ -663,6 +664,7 @@ class FuzzySearchEngine:
 
     def __init__(
         self,
+        source_db_id: Optional[int] = 1,
         text_fields: Optional[List[str]] = None,
         min_score: float = SEARCH_MIN_SCORE,
         rebuild_interval: Optional[int] = None,
@@ -670,6 +672,8 @@ class FuzzySearchEngine:
         if not RAPIDFUZZ_AVAILABLE:
             raise RuntimeError("rapidfuzz is not installed. Run: pip install rapidfuzz")
 
+        self.source_db_id      = int(source_db_id) if source_db_id is not None else None
+        self.is_global         = source_db_id is None
         self.text_fields       = text_fields or ["name", "brand_name", "category_name"]
         self.min_score         = min_score
         self.rebuild_interval  = rebuild_interval
@@ -700,8 +704,7 @@ class FuzzySearchEngine:
         """
         conn = get_connection()
         try:
-            rows = conn.execute(
-                """
+            sql = """
                 SELECT
                     p.id,
                     p.name,
@@ -724,28 +727,36 @@ class FuzzySearchEngine:
                     p.product_group_id,
                     p.group_variation_name,
                     p.category_id,
+                    p.source_db_id,
+                    CASE
+                      WHEN p.id >= (p.source_db_id * ?)
+                      THEN (p.id - (p.source_db_id * ?))
+                      ELSE p.id
+                    END AS source_product_id,
+                    COALESCE(cd.name, '') AS database_name,
                     COALESCE(b.name,  '')  AS brand_name,
                     COALESCE(c.name,  '')  AS category_name,
                     COALESCE(pg.name, '')  AS group_name,
-                    -- popularity: count of sell lines (real sales signal)
-                    COALESCE(sl.sell_count, 0) AS popularity_raw,
+                    -- popularity score from pre-aggregated product_metrics
+                    COALESCE(pm.popularity_score, 0) AS popularity_raw,
                     -- click_rate: cumulative click-throughs
                     COALESCE(pc.click_count, 0) AS click_count_raw
                 FROM products p
                 LEFT JOIN brands        b  ON b.id  = p.brand_id
                 LEFT JOIN categories    c  ON c.id  = p.category_id
                 LEFT JOIN product_group pg ON pg.id = p.product_group_id
-                -- aggregate sell lines per product (subquery avoids row explosion)
-                LEFT JOIN (
-                    SELECT product_id, COUNT(*) AS sell_count
-                    FROM transaction_sell_lines
-                    GROUP BY product_id
-                ) sl ON sl.product_id = p.id
+                LEFT JOIN connected_databases cd ON cd.id = p.source_db_id
+                LEFT JOIN product_metrics pm
+                    ON pm.product_id = p.id AND pm.source_db_id = p.source_db_id
                 LEFT JOIN product_clicks pc ON pc.product_id = p.id
                 WHERE p.is_inactive = 0
-                ORDER BY p.id
-                """
-            ).fetchall()
+            """
+            params: list = [_ID_SCOPE_MULTIPLIER, _ID_SCOPE_MULTIPLIER]
+            if not self.is_global:
+                sql += " AND p.source_db_id = ?"
+                params.append(self.source_db_id)
+            sql += " ORDER BY p.id"
+            rows = conn.execute(sql, tuple(params)).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()
@@ -1027,6 +1038,8 @@ class FuzzySearchEngine:
     def stats(self) -> dict:
         with self._lock:
             return {
+                "source_db_id":  self.source_db_id,
+                "mode":          "global" if self.is_global else "isolated",
                 "total_products": len(self._items),
                 "last_built":     self._last_built,
                 "min_score":      self.min_score,
@@ -1035,11 +1048,12 @@ class FuzzySearchEngine:
 
 
 # ── Module-level singleton ─────────────────────────────────────────────────────
-_engine: Optional[FuzzySearchEngine] = None
+_engines: Dict[int, FuzzySearchEngine] = {}
+_global_engine: Optional[FuzzySearchEngine] = None
 _engine_lock = threading.Lock()
 
 
-def get_engine(rebuild_interval: Optional[int] = None) -> FuzzySearchEngine:
+def get_engine(source_db_id: int = 1, rebuild_interval: Optional[int] = None) -> FuzzySearchEngine:
     """
     Return the module-level singleton engine, creating it on first call.
 
@@ -1048,9 +1062,30 @@ def get_engine(rebuild_interval: Optional[int] = None) -> FuzzySearchEngine:
     This prevents duplicate background threads when the module is imported
     multiple times (e.g. Flask debug reloader).
     """
-    global _engine
-    if _engine is None:
+    key = int(source_db_id)
+    if key not in _engines:
         with _engine_lock:
-            if _engine is None:
-                _engine = FuzzySearchEngine(rebuild_interval=rebuild_interval)
-    return _engine
+            if key not in _engines:
+                _engines[key] = FuzzySearchEngine(
+                    source_db_id=key,
+                    rebuild_interval=rebuild_interval,
+                )
+    return _engines[key]
+
+
+def get_global_engine(rebuild_interval: Optional[int] = None) -> FuzzySearchEngine:
+    """Return the global in-memory engine across all source databases."""
+    global _global_engine
+    if _global_engine is None:
+        with _engine_lock:
+            if _global_engine is None:
+                _global_engine = FuzzySearchEngine(
+                    source_db_id=None,
+                    rebuild_interval=rebuild_interval,
+                )
+    return _global_engine
+
+
+def rebuild_global_index() -> int:
+    """Force rebuild of global engine and return indexed product count."""
+    return get_global_engine().rebuild()

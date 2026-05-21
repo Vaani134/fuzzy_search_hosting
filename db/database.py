@@ -176,6 +176,18 @@ def _run_migrations() -> None:
         # ── Migration 8: multi-DB infrastructure tables (added in v8) ────────
         _migrate_multi_db_tables(conn)
 
+        # ── Migration 9: fault-tolerance tables (added in v9) ─────────────
+        _migrate_fault_tolerance(conn)
+
+        # ── Migration 10: per-db image host prefix (added in v10) ──────────
+        _add_column_if_missing(
+            conn,
+            table="connected_databases",
+            column="image_base_url",
+            definition="TEXT DEFAULT NULL",
+        )
+        conn.commit()
+
     except Exception as exc:
         print(f"[DB] Migration warning: {exc}")
     finally:
@@ -304,6 +316,7 @@ def _migrate_multi_db_tables(conn: sqlite3.Connection) -> None:
             username      TEXT    NOT NULL DEFAULT '',
             password      TEXT    NOT NULL DEFAULT '',
             database_name TEXT    NOT NULL,
+            image_base_url TEXT   DEFAULT NULL,
             last_sync_at  TEXT    DEFAULT NULL,
             sync_status   TEXT    NOT NULL DEFAULT 'never',
             created_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -374,6 +387,52 @@ def _migrate_multi_db_tables(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
     print("[DB] Multi-DB infrastructure tables ready.")
+
+
+def _migrate_fault_tolerance(conn: sqlite3.Connection) -> None:
+    """
+    Migration v9 — adds tables and columns needed for the fault-tolerant
+    sync engine introduced alongside Phase 1–10 of the hardening refactor.
+
+    Changes:
+      1. sync_errors        — stores per-row insertion failures with full context
+      2. sync_checkpoints.status — tracks per-table completion state so individual
+                               failed tables can be retried without restarting others
+    """
+    # sync_errors: row-level failure log (new table)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_errors (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            database_id   INTEGER NOT NULL,
+            table_name    TEXT    NOT NULL,
+            source_row_id INTEGER DEFAULT NULL,
+            error_message TEXT    NOT NULL,
+            raw_payload   TEXT    DEFAULT NULL,
+            traceback     TEXT    DEFAULT NULL,
+            created_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sync_errors_db_id ON sync_errors(database_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sync_errors_table ON sync_errors(table_name)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sync_errors_time  ON sync_errors(created_at)"
+    )
+
+    # sync_checkpoints.status: tracks per-table sync outcome
+    # Existing rows get 'completed' so they are not re-synced unnecessarily.
+    _add_column_if_missing(
+        conn, "sync_checkpoints", "status",
+        "TEXT NOT NULL DEFAULT 'completed'",
+    )
+
+    conn.commit()
+    print("[DB] Fault-tolerance tables ready (sync_errors, checkpoint status).")
 
 
 def seed_primary_database_from_settings() -> None:

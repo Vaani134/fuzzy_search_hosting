@@ -155,6 +155,15 @@ def api_image_search():
         top_k = min(max(1, top_k), 100)
     except (ValueError, TypeError):
         top_k = 20
+    db_raw = (request.form.get("db_id") or request.args.get("db_id") or "1").strip().lower()
+    global_raw = (request.form.get("global") or request.args.get("global") or "").strip().lower()
+    if db_raw == "all" or global_raw in ("1", "true", "yes"):
+        source_db_id = None
+    else:
+        try:
+            source_db_id = max(1, int(db_raw))
+        except (ValueError, TypeError):
+            source_db_id = 1
 
     # ── Run the image search pipeline ─────────────────────────────────────────
     try:
@@ -162,6 +171,7 @@ def api_image_search():
             image_bytes=image_bytes,
             filename=filename,
             top_k=top_k,
+            source_db_id=source_db_id,
         )
     except Exception as exc:
         return jsonify({"error": f"Image search failed: {exc}"}), 500

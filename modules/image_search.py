@@ -415,6 +415,7 @@ def search_by_image(
     image_bytes: bytes,
     filename: str = "",
     top_k: int = 20,
+    source_db_id: Optional[int] = 1,
 ) -> Dict[str, Any]:
     """
     Full image-to-search pipeline.
@@ -480,8 +481,8 @@ def search_by_image(
     # Import here (not at module top) to keep the module independent and
     # avoid circular imports.  get_engine() returns the singleton — no new
     # engine is created.
-    from modules.fuzzy_search import get_engine
-    engine  = get_engine()
+    from modules.fuzzy_search import get_engine, get_global_engine
+    engine  = get_global_engine() if source_db_id is None else get_engine(source_db_id=source_db_id)
     results = engine.search(query, top_k=top_k)
 
     return {

@@ -38,8 +38,8 @@ Routes
   -- Other API --
   GET  /api/product/<id>        — product detail JSON
   POST /api/product/<id>/click  — record a click-through (updates ranking)
-  POST /api/sync                — trigger MySQL → SQLite sync
-  GET  /api/sync/live           — real-time sync progress
+  POST /api/sync                — trigger MySQL → SQLite sync (legacy, syncs DB id=1)
+  GET  /api/sync/live           — real-time sync progress (legacy, DB id=1)
   GET  /api/sync/history        — sync log history
   GET  /api/sync/status         — latest sync status per table
   GET  /api/stats               — engine, DB, and cache stats
@@ -47,26 +47,58 @@ Routes
   GET  /api/settings            — get DB settings (password masked)
   POST /api/settings            — save DB settings
   POST /api/settings/test       — test DB connection
+
+  -- Multi-database management (new) --
+  GET    /api/databases                  — list all connected databases
+  POST   /api/databases                  — add a new connected database
+  GET    /api/database/<id>              — get one database (password masked)
+  PUT    /api/database/<id>              — update connection credentials
+  DELETE /api/database/<id>             — remove a connected database
+  POST   /api/database/<id>/sync        — start sync (full or incremental)
+  POST   /api/database/<id>/stop        — request graceful stop
+  GET    /api/database/<id>/status      — live state + last job + table log
+  GET    /api/database/<id>/logs        — in-memory sync log buffer (incremental ?since=)
+  GET    /api/database/<id>/errors      — recent row-level sync failures
+  POST   /api/database/<id>/test        — test MySQL connection
 """
 
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 from flask import Flask, render_template, request, jsonify, abort, send_file
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import SECRET_KEY, DEBUG, HOST, PORT, SEARCH_DEFAULT_K, SYNC_TABLES
-from db.database import init_db, get_connection, dict_from_row
-from modules.fuzzy_search import get_engine, apply_synonyms
-from modules.sync import sync_all, sync_all_background, sync_table, get_sync_status, get_sync_history, get_live_state
+from db.database import init_db, get_connection, dict_from_row, seed_primary_database_from_settings
+from modules.fuzzy_search import get_engine, get_global_engine, apply_synonyms
+from modules.sync import sync_all_background, sync_table, get_sync_status, get_sync_history, get_live_state
 from modules.autocomplete import get_suggestions
 from modules.zip_builder import build_zip
 from modules.settings_manager import (
     load as load_settings,
     save as save_settings,
-    test_connection,
+    test_connection as test_connection_legacy,
     get_mysql_config,
+)
+from modules.db_manager import (
+    list_databases,
+    get_database_masked,
+    add_database,
+    update_database,
+    delete_database,
+    update_sync_status,
+    test_connection as test_db_connection,
+)
+from modules.sync_manager import (
+    sync_database_background,
+    request_stop,
+    get_live_state as get_db_live_state,
+    get_all_live_states,
+    get_database_status,
+    get_sync_logs,
+    get_sync_errors,
+    get_active_job,
 )
 from routes.search_routes import search_bp
 from routes.image_search_routes import image_search_bp
@@ -85,8 +117,25 @@ app.register_blueprint(synonym_bp)
 
 
 # ── Jinja filter: resolve product image path → full URL ───────────────────────
+def _get_image_base_for_db(source_db_id: int) -> str:
+    """Return configured image base URL for a source database."""
+    if not source_db_id:
+        return ""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT image_base_url FROM connected_databases WHERE id = ?",
+            (int(source_db_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+    image_base_url = (row["image_base_url"] if row else "") or ""
+    image_base_url = image_base_url.strip().rstrip("/")
+    return image_base_url
+
+
 @app.template_filter("img_url")
-def img_url_filter(path: str) -> str:
+def img_url_filter(path: str, source_db_id: int = None) -> str:
     """
     Convert a DB image path to a full URL.
 
@@ -104,17 +153,81 @@ def img_url_filter(path: str) -> str:
 
     clean = path.lstrip("/")
 
+    base = _get_image_base_for_db(source_db_id)
+
+    if base:
+        if clean.startswith("uploads/"):
+            return f"{base}/{clean}"
+        if clean.startswith("img/"):
+            return f"{base}/uploads/{clean}"
+        if "/" not in clean:
+            return f"{base}/uploads/img/{clean}"
+        return f"{base}/{clean}"
+
+    # No configured base URL for this DB: return path as-is (relative) so
+    # there is no hardcoded cloud host fallback.
     if clean.startswith("uploads/"):
-        return f"https://novxcloud.com/{clean}"
+        return f"/{clean}"
     if clean.startswith("img/"):
-        return f"https://novxcloud.com/uploads/{clean}"
+        return f"/uploads/{clean}"
     if "/" not in clean:
-        return f"https://novxcloud.com/uploads/img/{clean}"
-    return f"https://novxcloud.com/{clean}"
+        return f"/uploads/img/{clean}"
+    return f"/{clean}"
 
 
 # Initialise SQLite schema on startup (also creates search_history + synonyms tables)
 init_db()
+
+# One-time migration: import db_settings.json → connected_databases table (id=1).
+# Idempotent — does nothing if connected_databases already has rows.
+seed_primary_database_from_settings()
+
+
+def _cleanup_stale_running_sync_jobs() -> None:
+    """
+    Mark orphaned `running` jobs as failed on app startup.
+
+    Any process restart clears in-memory live sync state, so rows left in
+    sync_jobs with status='running' cannot still be truly running.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_connection()
+    try:
+        stale_rows = conn.execute(
+            "SELECT id, database_id FROM sync_jobs WHERE status = 'running'"
+        ).fetchall()
+        if not stale_rows:
+            return
+
+        stale_ids = [row["id"] for row in stale_rows]
+        db_ids = sorted({row["database_id"] for row in stale_rows})
+        placeholders = ",".join("?" for _ in stale_ids)
+
+        conn.execute(
+            f"UPDATE sync_jobs "
+            f"SET status = 'failed', finished_at = ?, "
+            f"error_msg = COALESCE(error_msg, 'App restarted while sync was running') "
+            f"WHERE id IN ({placeholders})",
+            (now, *stale_ids),
+        )
+        db_placeholders = ",".join("?" for _ in db_ids)
+        conn.execute(
+            f"""
+            UPDATE connected_databases
+            SET sync_status = ?, updated_at = ?
+            WHERE id IN ({db_placeholders})
+            """,
+            ("error", now, *db_ids),
+        )
+        conn.commit()
+        print(
+            f"[startup] Marked {len(stale_ids)} stale running sync job(s) as failed."
+        )
+    finally:
+        conn.close()
+
+
+_cleanup_stale_running_sync_jobs()
 
 # Reload synonyms from DB now that the table is guaranteed to exist.
 # The first call at module import time may have found an empty DB.
@@ -125,7 +238,7 @@ _reload_synonyms()
 # Background automatic index rebuilding is DISABLED for this environment.
 # We are relying on fully manual index rebuilds via the API.
 # Use POST /api/search/rebuild to refresh the in-memory index.
-engine = get_engine(rebuild_interval=None)
+engine = get_engine(source_db_id=1, rebuild_interval=None)
 
 
 # ── UI Routes ──────────────────────────────────────────────────────────────────
@@ -224,6 +337,10 @@ def index():
     Main search page — supports pagination, filters, and sort.
     Passes all parameters to the template for UI rendering.
     """
+    db_raw = (request.args.get("db_id", "1") or "1").strip().lower()
+    global_flag = (request.args.get("global", "") or "").strip().lower() in ("1", "true", "yes")
+    is_global = db_raw == "all" or global_flag
+    db_id = None if is_global else max(1, int(db_raw or 1))
     query    = request.args.get("q", "").strip()
     page     = max(1, int(request.args.get("page", 1) or 1))
     limit    = min(max(1, int(request.args.get("limit", SEARCH_DEFAULT_K) or SEARCH_DEFAULT_K)), 100)
@@ -235,7 +352,8 @@ def index():
     results      = []
     total_results = 0
     total_pages   = 1
-    stats         = engine.stats()
+    search_engine = get_global_engine() if is_global else get_engine(source_db_id=db_id)
+    stats         = search_engine.stats()
 
     if query:
         import math
@@ -253,7 +371,7 @@ def index():
             except ValueError:
                 pass
 
-        all_results = engine.search_with_field_scores(
+        all_results = search_engine.search_with_field_scores(
             query, top_k=100, filters=filters if filters else None
         )
 
@@ -281,18 +399,37 @@ def index():
     else:
         suggestion = None
 
+    databases = list_databases()
+    if (not is_global) and databases and not any(d["id"] == db_id for d in databases):
+        db_id = databases[0]["id"]
+        search_engine = get_engine(source_db_id=db_id)
+        stats = search_engine.stats()
+
     # Fetch distinct categories for the filter dropdown
     conn = get_connection()
     try:
-        category_rows = conn.execute(
-            """
-            SELECT DISTINCT c.name
-            FROM categories c
-            INNER JOIN products p ON p.category_id = c.id AND p.is_inactive = 0
-            WHERE c.deleted_at IS NULL
-            ORDER BY c.name
-            """
-        ).fetchall()
+        if is_global:
+            category_rows = conn.execute(
+                """
+                SELECT DISTINCT c.name
+                FROM categories c
+                INNER JOIN products p ON p.category_id = c.id AND p.is_inactive = 0
+                WHERE c.deleted_at IS NULL
+                ORDER BY c.name
+                """
+            ).fetchall()
+        else:
+            category_rows = conn.execute(
+                """
+                SELECT DISTINCT c.name
+                FROM categories c
+                INNER JOIN products p ON p.category_id = c.id AND p.is_inactive = 0
+                WHERE c.deleted_at IS NULL AND p.source_db_id = ?
+                ORDER BY c.name
+                """
+                ,
+                (db_id,),
+            ).fetchall()
         categories = [r["name"] for r in category_rows]
     finally:
         conn.close()
@@ -300,6 +437,9 @@ def index():
     return render_template(
         "index.html",
         query=query,
+        db_id=("all" if is_global else db_id),
+        is_global=is_global,
+        databases=databases,
         results=results,
         stats=stats,
         top_k=limit,
@@ -338,6 +478,52 @@ def product_detail(product_id: int):
             """,
             (product_id,),
         ).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        abort(404)
+
+    product = dict_from_row(row)
+    return render_template("product.html", product=product)
+
+
+@app.route("/product/<int:db_id>/<int:product_id>")
+def product_detail_scoped(db_id: int, product_id: int):
+    """Product detail page using source database id + source product id."""
+    scoped_id = db_id * 1_000_000_000 + product_id
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT p.*,
+                   COALESCE(b.name, '')  AS brand_name,
+                   COALESCE(c.name, '')  AS category_name,
+                   COALESCE(pg.name, '') AS group_name
+            FROM products p
+            LEFT JOIN brands        b  ON b.id  = p.brand_id
+            LEFT JOIN categories    c  ON c.id  = p.category_id
+            LEFT JOIN product_group pg ON pg.id = p.product_group_id
+            WHERE p.id = ? AND p.source_db_id = ?
+            """,
+            (scoped_id, db_id),
+        ).fetchone()
+        if not row:
+            # Backward-compat fallback: handle rows that still use unscoped IDs.
+            row = conn.execute(
+                """
+                SELECT p.*,
+                       COALESCE(b.name, '')  AS brand_name,
+                       COALESCE(c.name, '')  AS category_name,
+                       COALESCE(pg.name, '') AS group_name
+                FROM products p
+                LEFT JOIN brands        b  ON b.id  = p.brand_id
+                LEFT JOIN categories    c  ON c.id  = p.category_id
+                LEFT JOIN product_group pg ON pg.id = p.product_group_id
+                WHERE p.id = ? AND p.source_db_id = ?
+                """,
+                (product_id, db_id),
+            ).fetchone()
     finally:
         conn.close()
 
@@ -469,18 +655,18 @@ def api_sync():
                         "message": "A sync is already in progress."}), 409
 
     def _after_sync(results):
-        engine.rebuild()
+        get_engine(source_db_id=1).rebuild()
         from modules.cache import search_cache as _cache
         _cache.clear()
 
     if tables:
         valid   = [t for t in tables if t in SYNC_TABLES]
         results = [sync_table(t, full=full) for t in valid]
-        engine.rebuild()
+        get_engine(source_db_id=1).rebuild()
         from modules.cache import search_cache as _cache
         _cache.clear()
         return jsonify({"status": "ok", "results": results,
-                        "indexed": engine.stats()["total_products"]})
+                        "indexed": get_engine(source_db_id=1).stats()["total_products"]})
 
     sync_all_background(full=full, callback=_after_sync)
     return jsonify({"status": "started",
@@ -509,14 +695,22 @@ def api_sync_status():
 @app.route("/api/stats")
 def api_stats():
     """GET /api/stats — engine and DB stats."""
-    stats = engine.stats()
+    db_id = max(1, int(request.args.get("db_id", 1) or 1))
+    stats = get_engine(source_db_id=db_id).stats()
     conn  = get_connection()
     try:
         product_count  = conn.execute(
-            "SELECT COUNT(*) FROM products WHERE is_inactive=0"
+            "SELECT COUNT(*) FROM products WHERE is_inactive=0 AND source_db_id=?",
+            (db_id,),
         ).fetchone()[0]
-        brand_count    = conn.execute("SELECT COUNT(*) FROM brands").fetchone()[0]
-        category_count = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
+        brand_count    = conn.execute(
+            "SELECT COUNT(*) FROM brands WHERE source_db_id=?",
+            (db_id,),
+        ).fetchone()[0]
+        category_count = conn.execute(
+            "SELECT COUNT(*) FROM categories WHERE source_db_id=?",
+            (db_id,),
+        ).fetchone()[0]
         search_count   = conn.execute("SELECT COUNT(*) FROM search_history").fetchone()[0]
     finally:
         conn.close()
@@ -524,6 +718,7 @@ def api_stats():
     from modules.cache import search_cache as _cache
     return jsonify({
         **stats,
+        "db_id":         db_id,
         "db_products":    product_count,
         "db_brands":      brand_count,
         "db_categories":  category_count,
@@ -678,8 +873,223 @@ def api_settings_test():
     if password in ("••••••••",):
         password = current["password"]
 
-    result = test_connection(host, port, user, password, database)
+    result = test_connection_legacy(host, port, user, password, database)
     return jsonify(result)
+
+
+# ── Multi-database management API ─────────────────────────────────────────────
+#
+# These routes manage the connected_databases table that replaces the flat
+# db_settings.json approach.  All existing /api/settings routes continue to
+# work unchanged — they now read/write connected_databases id=1 via the
+# legacy settings_manager, keeping full backward compatibility.
+
+
+@app.route("/api/databases", methods=["GET"])
+def api_list_databases():
+    """
+    GET /api/databases
+    Return all connected databases.  Passwords are masked in the response.
+    """
+    return jsonify(list_databases())
+
+
+@app.route("/api/databases", methods=["POST"])
+def api_add_database():
+    """
+    POST /api/databases
+    Body: {name, host, port, username, password, database_name, image_base_url}
+    Add a new ERP database connection.  Returns the created record (id included).
+    """
+    body = request.get_json(silent=True) or {}
+    required = ("name", "host", "database_name")
+    missing = [f for f in required if not body.get(f, "").strip()]
+    if missing:
+        return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
+
+    try:
+        new_id = add_database(
+            name          = body["name"].strip(),
+            host          = body.get("host", "").strip(),
+            port          = int(body.get("port", 3306) or 3306),
+            username      = body.get("username", "").strip(),
+            password      = body.get("password", ""),
+            database_name = body["database_name"].strip(),
+            image_base_url = body.get("image_base_url", "").strip(),
+        )
+        db = get_database_masked(new_id)
+        return jsonify({"status": "ok", "database": db}), 201
+    except (ValueError, Exception) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/database/<int:db_id>", methods=["GET"])
+def api_get_database(db_id: int):
+    """GET /api/database/<id> — return one connected database (password masked)."""
+    db = get_database_masked(db_id)
+    if not db:
+        return jsonify({"error": "Database not found"}), 404
+    return jsonify(db)
+
+
+@app.route("/api/database/<int:db_id>", methods=["PUT"])
+def api_update_database(db_id: int):
+    """
+    PUT /api/database/<id>
+    Body: any subset of {name, host, port, username, password, database_name, image_base_url}
+    Update connection credentials for an existing database.
+    Send password as blank string to leave it unchanged.
+    """
+    body = request.get_json(silent=True) or {}
+
+    # If password is blank or the masked sentinel, keep existing value
+    if body.get("password", "") in ("", "••••••••"):
+        body.pop("password", None)
+
+    updated = update_database(db_id, **body)
+    if not updated:
+        return jsonify({"error": "Database not found"}), 404
+
+    return jsonify({"status": "ok", "database": get_database_masked(db_id)})
+
+
+@app.route("/api/database/<int:db_id>", methods=["DELETE"])
+def api_delete_database(db_id: int):
+    """
+    DELETE /api/database/<id>
+    Remove a connected database.  Fails if a sync is currently running.
+    """
+    try:
+        removed = delete_database(db_id)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 409
+
+    if not removed:
+        return jsonify({"error": "Database not found"}), 404
+
+    return jsonify({"status": "ok", "message": f"Database {db_id} deleted."})
+
+
+@app.route("/api/database/<int:db_id>/test", methods=["POST"])
+def api_test_database(db_id: int):
+    """POST /api/database/<id>/test — test the MySQL connection for this database."""
+    result = test_db_connection(db_id)
+    return jsonify(result)
+
+
+@app.route("/api/database/<int:db_id>/sync", methods=["POST"])
+def api_database_sync(db_id: int):
+    """
+    POST /api/database/<id>/sync
+    Body (JSON, optional): {"full": true|false}
+
+    Start a sync for one connected database in a background thread.
+    - full=true  : delete this source's rows and reimport everything.
+    - full=false : only fetch rows updated since last_sync_at (incremental).
+    - omitted    : auto-detect (full on first run, incremental thereafter).
+
+    Returns immediately. Poll GET /api/database/<id>/status for progress.
+    """
+    db = get_database_masked(db_id)
+    if not db:
+        return jsonify({"error": "Database not found"}), 404
+
+    # Reject if this database already has a running sync in DB or memory
+    active_job = get_active_job(db_id)
+    if active_job:
+        return jsonify({
+            "status": "already_running",
+            "message": f"Database {db_id} already has a running sync job "
+                       f"(job_id={active_job['id']}). "
+                       "Use POST /api/database/<id>/stop to request stop.",
+        }), 409
+
+    live = get_db_live_state(db_id)
+    if live.get("running"):
+        return jsonify({
+            "status":  "already_running",
+            "message": f"Database {db_id} already has an active sync. "
+                       "Use POST /api/database/<id>/stop to cancel it.",
+        }), 409
+
+    body = request.get_json(silent=True) or {}
+    full = body.get("full", None)   # None → auto-detect in sync_manager
+
+    sync_database_background(db_id=db_id, full=full)
+    return jsonify({
+        "status":  "started",
+        "db_id":   db_id,
+        "message": f"Sync started for database '{db['name']}'. "
+                   f"Poll /api/database/{db_id}/status for progress.",
+    })
+
+
+@app.route("/api/database/<int:db_id>/stop", methods=["POST"])
+def api_database_stop(db_id: int):
+    """
+    POST /api/database/<id>/stop
+    Request a graceful stop for the running sync on this database.
+    The sync thread will exit after its current batch — no force-kill.
+    """
+    result = request_stop(db_id)
+    status_code = 200 if result["ok"] else 404
+    return jsonify(result), status_code
+
+
+@app.route("/api/database/<int:db_id>/status", methods=["GET"])
+def api_database_status(db_id: int):
+    """
+    GET /api/database/<id>/status
+    Return combined sync status for one database:
+      - live:         in-memory real-time state (updated after every batch)
+      - last_job:     most recent sync_jobs row
+      - table_status: latest sync_log entry per table
+    """
+    db = get_database_masked(db_id)
+    if not db:
+        return jsonify({"error": "Database not found"}), 404
+
+    status = get_database_status(db_id)
+    status["database"] = db
+    return jsonify(status)
+
+
+@app.route("/api/database/<int:db_id>/logs", methods=["GET"])
+def api_database_logs(db_id: int):
+    """
+    GET /api/database/<id>/logs[?since=<iso-ts>]
+    Return the in-memory live log buffer for a database.
+    Pass ?since=<ISO-8601 timestamp> to get only entries after that point
+    (useful for incremental polling without re-processing old entries).
+    """
+    if not get_database_masked(db_id):
+        return jsonify({"error": "Database not found"}), 404
+    since = request.args.get("since")
+    logs  = get_sync_logs(db_id, since_ts=since)
+    return jsonify({"db_id": db_id, "logs": logs, "count": len(logs)})
+
+
+@app.route("/api/database/<int:db_id>/errors", methods=["GET"])
+def api_database_errors(db_id: int):
+    """
+    GET /api/database/<id>/errors[?limit=100]
+    Return recent row-level sync errors from the sync_errors table.
+    """
+    if not get_database_masked(db_id):
+        return jsonify({"error": "Database not found"}), 404
+    limit  = min(int(request.args.get("limit", 100)), 500)
+    errors = get_sync_errors(db_id, limit=limit)
+    return jsonify({"db_id": db_id, "errors": errors, "count": len(errors)})
+
+
+@app.route("/api/databases/live", methods=["GET"])
+def api_all_databases_live():
+    """
+    GET /api/databases/live
+    Return in-memory live sync state for ALL connected databases.
+    Useful for the settings page to show running-indicator badges.
+    """
+    return jsonify(get_all_live_states())
 
 
 # ── Error handlers ─────────────────────────────────────────────────────────────

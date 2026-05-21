@@ -17,7 +17,13 @@ Endpoints
 import math
 from flask import Blueprint, request, jsonify, render_template
 
-from modules.fuzzy_search import get_engine, apply_synonyms, get_query_suggestion
+from modules.fuzzy_search import (
+    get_engine,
+    get_global_engine,
+    rebuild_global_index,
+    apply_synonyms,
+    get_query_suggestion,
+)
 from modules.autocomplete import get_suggestions
 from modules.analytics import log_search, get_recent_searches, get_top_queries, \
     get_zero_result_queries, get_trending_queries
@@ -50,6 +56,17 @@ def _int_param(name: str, default: int = 0) -> int:
         return int(val)
     except ValueError:
         return default
+
+
+def _db_id_param(default: int = 1) -> int:
+    """Resolve source database id from query params."""
+    return max(1, _int_param("db_id", default))
+
+
+def _is_global_mode() -> bool:
+    db_id_raw = (request.args.get("db_id") or "").strip().lower()
+    global_raw = (request.args.get("global") or "").strip().lower()
+    return db_id_raw == "all" or global_raw in ("1", "true", "yes")
 
 
 # ── GET /api/search ────────────────────────────────────────────────────────────
@@ -89,6 +106,8 @@ def api_search():
         return jsonify({"error": "q parameter is required"}), 400
 
     # Pagination
+    global_mode = _is_global_mode()
+    db_id = _db_id_param() if not global_mode else None
     page  = max(1, _int_param("page", 1))
     limit = min(max(1, _int_param("limit", SEARCH_DEFAULT_K)), 100)
 
@@ -113,7 +132,8 @@ def api_search():
     # if cached is not None:
     #     return jsonify(cached)
     # ── Cache lookup ──────────────────────────────────────────────────────────
-    cache_key = search_cache.make_key(query, active_filters, page, limit, sort)
+    scoped_filters = {**active_filters, "db_id": "all" if global_mode else db_id}
+    cache_key = search_cache.make_key(query, scoped_filters, page, limit, sort)
 
     #print(f"[DEBUG] Cache key: {cache_key}")
 
@@ -123,7 +143,7 @@ def api_search():
         return jsonify(cached)
 
     # ── Execute search ────────────────────────────────────────────────────────
-    engine          = get_engine()
+    engine = get_global_engine() if global_mode else get_engine(source_db_id=db_id)
     expanded_query  = apply_synonyms(query)
 
     # Fetch all matching results (up to hard cap) then paginate in Python.
@@ -147,6 +167,8 @@ def api_search():
     start         = (page - 1) * limit
     end           = start + limit
     page_results  = all_results[start:end]
+    for row in page_results:
+        row["product_id"] = row.get("source_product_id", row.get("id"))
 
     # ── "Did You Mean" suggestion ─────────────────────────────────────────────
     # Build a choices pool from the top result names (real product vocabulary)
@@ -172,6 +194,8 @@ def api_search():
 
     # ── Build response ────────────────────────────────────────────────────────
     response = {
+        "db_id":          "all" if global_mode else db_id,
+        "mode":           "global" if global_mode else "isolated",
         "query":          query,
         "expanded_query": expanded_query if expanded_query != query else query,
         "page":           page,
@@ -276,11 +300,24 @@ def api_rebuild():
     For production, consider adding API token authentication.
     See DEPLOYMENT_SECURITY.md for details.
     """
-    engine = get_engine()
+    if _is_global_mode():
+        count = rebuild_global_index()
+        cleared = search_cache.clear()
+        return jsonify({
+            "status":        "ok",
+            "mode":          "global",
+            "db_id":         "all",
+            "indexed":       count,
+            "cache_cleared": cleared,
+        })
+
+    db_id = _db_id_param()
+    engine = get_engine(source_db_id=db_id)
     count  = engine.rebuild()
     cleared = search_cache.clear()
     return jsonify({
         "status":        "ok",
+        "db_id":         db_id,
         "indexed":       count,
         "cache_cleared": cleared,
     })
@@ -295,13 +332,31 @@ def api_autocomplete():
     Returns fast autocomplete suggestions (prefix + contains match).
     """
     query = request.args.get("q", "").strip()
+    if _is_global_mode():
+        suggestions = get_suggestions(query, limit=limit, source_db_id=None)
+        return jsonify(suggestions)
+
+    db_id = _db_id_param()
     limit = min(max(1, _int_param("limit", 10)), 20)
 
     if not query or len(query) < 2:
         return jsonify([])
 
-    suggestions = get_suggestions(query, limit=limit)
+    suggestions = get_suggestions(query, limit=limit, source_db_id=db_id)
     return jsonify(suggestions)
+
+
+@search_bp.route("/api/search/rebuild-global", methods=["POST"])
+def api_rebuild_global():
+    count = rebuild_global_index()
+    cleared = search_cache.clear()
+    return jsonify({
+        "status": "ok",
+        "mode": "global",
+        "db_id": "all",
+        "indexed": count,
+        "cache_cleared": cleared,
+    })
 
 
 # ── GET /api/cache/stats ───────────────────────────────────────────────────────

@@ -15,7 +15,7 @@ Results are deduplicated and ranked: exact prefix > contains.
 import re
 import sys
 import os
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.database import get_connection
@@ -26,7 +26,7 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower().strip())
 
 
-def get_suggestions(query: str, limit: int = 10) -> List[Dict]:
+def get_suggestions(query: str, limit: int = 10, source_db_id: Optional[int] = 1) -> List[Dict]:
     """
     Return autocomplete suggestions for `query`.
 
@@ -48,78 +48,98 @@ def get_suggestions(query: str, limit: int = 10) -> List[Dict]:
 
     try:
         # ── 1. Product names — prefix match (highest priority) ────────────────
-        rows = conn.execute(
-            """
-            SELECT id, name, 1 AS priority
+        product_sql = """
+            SELECT id, name, source_db_id, 1 AS priority
             FROM products
             WHERE name LIKE ? AND is_inactive = 0
-            ORDER BY name
-            LIMIT ?
-            """,
-            (q_like_prefix, limit),
-        ).fetchall()
+        """
+        product_params = [q_like_prefix]
+        if source_db_id is not None:
+            product_sql += " AND source_db_id = ?"
+            product_params.append(int(source_db_id))
+        product_sql += " ORDER BY name LIMIT ?"
+        product_params.append(limit)
+        rows = conn.execute(product_sql, tuple(product_params)).fetchall()
 
         for r in rows:
             key = ("product", r["name"].lower())
             if key not in seen:
                 seen.add(key)
-                results.append({"text": r["name"], "type": "product", "id": r["id"], "priority": 1})
+                results.append({
+                    "text": r["name"], "type": "product", "id": r["id"],
+                    "source_db_id": r["source_db_id"], "priority": 1
+                })
 
         # ── 2. Brand names — prefix match ─────────────────────────────────────
-        rows = conn.execute(
-            """
-            SELECT id, name
+        brand_sql = """
+            SELECT id, name, source_db_id
             FROM brands
             WHERE name LIKE ? AND deleted_at IS NULL
-            ORDER BY name
-            LIMIT ?
-            """,
-            (q_like_prefix, limit // 2),
-        ).fetchall()
+        """
+        brand_params = [q_like_prefix]
+        if source_db_id is not None:
+            brand_sql += " AND source_db_id = ?"
+            brand_params.append(int(source_db_id))
+        brand_sql += " ORDER BY name LIMIT ?"
+        brand_params.append(limit // 2)
+        rows = conn.execute(brand_sql, tuple(brand_params)).fetchall()
 
         for r in rows:
             key = ("brand", r["name"].lower())
             if key not in seen:
                 seen.add(key)
-                results.append({"text": r["name"], "type": "brand", "id": r["id"], "priority": 2})
+                results.append({
+                    "text": r["name"], "type": "brand", "id": r["id"],
+                    "source_db_id": r["source_db_id"], "priority": 2
+                })
 
         # ── 3. Category names — prefix match ──────────────────────────────────
-        rows = conn.execute(
-            """
-            SELECT id, name
+        category_sql = """
+            SELECT id, name, source_db_id
             FROM categories
             WHERE name LIKE ? AND deleted_at IS NULL
-            ORDER BY name
-            LIMIT ?
-            """,
-            (q_like_prefix, limit // 2),
-        ).fetchall()
+        """
+        category_params = [q_like_prefix]
+        if source_db_id is not None:
+            category_sql += " AND source_db_id = ?"
+            category_params.append(int(source_db_id))
+        category_sql += " ORDER BY name LIMIT ?"
+        category_params.append(limit // 2)
+        rows = conn.execute(category_sql, tuple(category_params)).fetchall()
 
         for r in rows:
             key = ("category", r["name"].lower())
             if key not in seen:
                 seen.add(key)
-                results.append({"text": r["name"], "type": "category", "id": r["id"], "priority": 3})
+                results.append({
+                    "text": r["name"], "type": "category", "id": r["id"],
+                    "source_db_id": r["source_db_id"], "priority": 3
+                })
 
         # ── 4. Fill remaining slots with contains-match on products ───────────
         if len(results) < limit:
             remaining = limit - len(results)
-            rows = conn.execute(
-                """
-                SELECT id, name
+            fill_sql = """
+                SELECT id, name, source_db_id
                 FROM products
                 WHERE name LIKE ? AND name NOT LIKE ? AND is_inactive = 0
-                ORDER BY name
-                LIMIT ?
-                """,
-                (q_like_contains, q_like_prefix, remaining),
-            ).fetchall()
+            """
+            fill_params = [q_like_contains, q_like_prefix]
+            if source_db_id is not None:
+                fill_sql += " AND source_db_id = ?"
+                fill_params.append(int(source_db_id))
+            fill_sql += " ORDER BY name LIMIT ?"
+            fill_params.append(remaining)
+            rows = conn.execute(fill_sql, tuple(fill_params)).fetchall()
 
             for r in rows:
                 key = ("product", r["name"].lower())
                 if key not in seen:
                     seen.add(key)
-                    results.append({"text": r["name"], "type": "product", "id": r["id"], "priority": 4})
+                    results.append({
+                        "text": r["name"], "type": "product", "id": r["id"],
+                        "source_db_id": r["source_db_id"], "priority": 4
+                    })
 
     finally:
         conn.close()

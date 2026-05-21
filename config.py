@@ -26,7 +26,8 @@ SQLITE_PATH = os.getenv("SQLITE_PATH") or os.path.join(BASE_DIR, "db", "local.db
 SCHEMA_PATH = os.path.join(BASE_DIR, "db", "schema.sql")
 
 # ── Sync settings ──────────────────────────────────────────────────────────────
-# Tables to sync from MySQL → SQLite, in dependency order
+# Legacy list (kept for backward-compat with old /api/sync endpoint).
+# New code uses CORE_SYNC_TABLES from sync_manager.py.
 SYNC_TABLES = [
     "brands",
     "categories",
@@ -36,9 +37,18 @@ SYNC_TABLES = [
     "transaction_sell_lines",
 ]
 
-# How many rows to fetch per batch during sync
-# 2000 rows per batch = ~244 round trips for 488k transaction_sell_lines rows
-# (vs 976 round trips at 500). Fewer connections = less chance of timeout.
+# Core tables synced by the new multi-DB engine (sync_manager.py).
+# transactions and transaction_sell_lines are intentionally excluded —
+# their data is captured via a lightweight aggregate into product_metrics.
+CORE_SYNC_TABLES = [
+    "brands",
+    "categories",
+    "product_group",
+    "products",
+]
+
+# How many rows to fetch per batch during sync.
+# 2000 rows ≈ 244 round-trips for 488k products. Fewer connections = less timeout risk.
 SYNC_BATCH_SIZE = 2000
 
 # ── Search settings ────────────────────────────────────────────────────────────

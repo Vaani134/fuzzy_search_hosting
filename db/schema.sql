@@ -284,6 +284,7 @@ CREATE TABLE IF NOT EXISTS connected_databases (
     username      TEXT    NOT NULL DEFAULT '',
     password      TEXT    NOT NULL DEFAULT '',
     database_name TEXT    NOT NULL,
+    image_base_url TEXT   DEFAULT NULL,
     last_sync_at  TEXT    DEFAULT NULL,
     sync_status   TEXT    NOT NULL DEFAULT 'never',
     created_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -354,3 +355,28 @@ CREATE TABLE IF NOT EXISTS product_metrics (
 
 CREATE INDEX IF NOT EXISTS idx_product_metrics_pid   ON product_metrics(product_id);
 CREATE INDEX IF NOT EXISTS idx_product_metrics_score ON product_metrics(popularity_score);
+
+-- ─── sync_errors (row-level sync failure log) ─────────────────────────────────
+--
+-- One row is written per failing MySQL row during an upsert attempt.
+-- Allows production debugging without re-running the full sync:
+--   - source_row_id : the MySQL primary key of the row that failed
+--   - error_message : short exception message
+--   - raw_payload   : JSON snapshot of the MySQL row (capped at 8 KB)
+--   - traceback     : full Python traceback (capped at 4 KB)
+--
+-- Never blocks the sync — if logging itself fails the sync continues.
+CREATE TABLE IF NOT EXISTS sync_errors (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    database_id   INTEGER NOT NULL,
+    table_name    TEXT    NOT NULL,
+    source_row_id INTEGER DEFAULT NULL,
+    error_message TEXT    NOT NULL,
+    raw_payload   TEXT    DEFAULT NULL,   -- JSON snapshot of the failing MySQL row
+    traceback     TEXT    DEFAULT NULL,   -- Python traceback string
+    created_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_errors_db_id ON sync_errors(database_id);
+CREATE INDEX IF NOT EXISTS idx_sync_errors_table ON sync_errors(table_name);
+CREATE INDEX IF NOT EXISTS idx_sync_errors_time  ON sync_errors(created_at);

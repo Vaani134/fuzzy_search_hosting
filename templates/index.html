@@ -95,8 +95,31 @@
   <p class="text-muted mb-4">
     Typo-tolerant &bull; Word-order independent &bull; Partial keyword matching
   </p>
+  {% if databases and databases|length > 1 %}
+  <div class="d-flex justify-content-center mb-3">
+    <form method="GET" action="/search" id="db-switch-form" class="d-flex align-items-center gap-2">
+      <label for="db-switch" class="text-muted mb-0" style="font-size:.9rem;">Database</label>
+      <select id="db-switch" name="db_id" class="form-select form-select-sm" style="min-width:260px;" onchange="document.getElementById('db-switch-form').submit();">
+        <option value="all" {% if db_id == 'all' %}selected{% endif %}>All Databases</option>
+        {% for db in databases %}
+        <option value="{{ db.id }}" {% if db.id == db_id %}selected{% endif %}>
+          {{ db.name }} (ID {{ db.id }})
+        </option>
+        {% endfor %}
+      </select>
+      <input type="hidden" name="q" value="{{ query }}" />
+      <input type="hidden" name="page" value="1" />
+      <input type="hidden" name="limit" value="{{ limit }}" />
+      <input type="hidden" name="sort" value="{{ sort }}" />
+      <input type="hidden" name="category" value="{{ category }}" />
+      <input type="hidden" name="min_price" value="{{ min_price }}" />
+      <input type="hidden" name="max_price" value="{{ max_price }}" />
+    </form>
+  </div>
+  {% endif %}
 
   <form method="GET" action="/search" class="search-wrapper" id="search-form" onsubmit="showLoading()">
+    <input type="hidden" name="db_id" value="{{ db_id }}" />
     <div class="input-group shadow-sm">
       <input
         type="text"
@@ -175,7 +198,7 @@
          style="background:#eff6ff; border:1px solid #bfdbfe; font-size:.9rem;">
       <i class="bi bi-lightbulb text-primary"></i>
       <span class="text-muted">Did you mean</span>
-      <a href="/search?q={{ suggestion | urlencode }}&limit={{ limit }}&sort={{ sort }}"
+      <a href="/search?db_id={{ db_id }}&q={{ suggestion | urlencode }}&limit={{ limit }}&sort={{ sort }}"
          class="fw-semibold text-primary text-decoration-none"
          style="border-bottom:1px dashed #2563eb;">
         {{ suggestion }}
@@ -190,6 +213,7 @@
 <!-- ── Filter / Sort panel (shown when there's a query or filters active) ── -->
 {% if query or category or min_price or max_price %}
 <form method="GET" action="/search" id="filter-form" onsubmit="showLoading()">
+  <input type="hidden" name="db_id" value="{{ db_id }}" />
   <input type="hidden" name="q"     value="{{ query }}" />
   <input type="hidden" name="page"  value="1" />
   <input type="hidden" name="limit" value="{{ limit }}" />
@@ -247,7 +271,7 @@
           <i class="bi bi-funnel me-1"></i>Apply
         </button>
         {% if category or min_price or max_price %}
-        <a href="/search?q={{ query | urlencode }}&sort={{ sort }}&limit={{ limit }}"
+        <a href="/search?db_id={{ db_id }}&q={{ query | urlencode }}&sort={{ sort }}&limit={{ limit }}"
            class="btn btn-outline-secondary btn-sm">
           <i class="bi bi-x"></i>
         </a>
@@ -266,7 +290,7 @@
   <p class="mt-3">Type something above to start searching.</p>
   <div class="mt-4 d-flex justify-content-center gap-2 flex-wrap">
     {% for hint in ["hookah", "grinder", "marlboro", "glass pipe", "energy drink"] %}
-    <a href="/search?q={{ hint }}" class="btn btn-outline-secondary btn-sm rounded-pill">
+    <a href="/search?db_id={{ db_id }}&q={{ hint }}" class="btn btn-outline-secondary btn-sm rounded-pill">
       {{ hint }}
     </a>
     {% endfor %}
@@ -280,7 +304,7 @@
   <p class="mt-3">No products matched <strong>"{{ query }}"</strong>.</p>
   <p class="small">Try a shorter keyword, check the spelling, or remove filters.</p>
   {% if category or min_price or max_price %}
-  <a href="/search?q={{ query | urlencode }}" class="btn btn-outline-primary btn-sm mt-2">
+  <a href="/search?db_id={{ db_id }}&q={{ query | urlencode }}" class="btn btn-outline-primary btn-sm mt-2">
     <i class="bi bi-x-circle me-1"></i>Clear filters
   </a>
   {% endif %}
@@ -307,7 +331,7 @@
 <div class="row row-cols-1 row-cols-sm-2 row-cols-md-3 row-cols-xl-4 g-4">
   {% for p in results %}
   <div class="col">
-    {% set img = (p.main_image or p.image) | img_url %}
+    {% set img = (p.main_image or p.image) | img_url(p.source_db_id) %}
     <div class="card product-card h-100 shadow-sm position-relative"
          id="card-{{ p.id }}">
 
@@ -325,7 +349,7 @@
       </div>
 
       <!-- Product image -->
-      <a href="/product/{{ p.id }}">
+      <a href="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}">
         {% if img %}
         <img
           src="{{ img }}"
@@ -347,7 +371,7 @@
 
         <!-- Name (highlighted) -->
         <h6 class="card-title mb-1">
-          <a href="/product/{{ p.id }}" class="text-decoration-none text-dark stretched-link-off"
+          <a href="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}" class="text-decoration-none text-dark stretched-link-off"
              data-product-name="{{ p.name }}">
             {{ p.name }}
           </a>
@@ -362,6 +386,9 @@
           <span class="badge bg-light text-dark border">{{ p.category_name }}</span>
           {% endif %}
         </div>
+        {% if is_global %}
+        <small class="text-muted mb-2 d-block">Source: {{ p.database_name or ('DB ' ~ p.source_db_id) }}</small>
+        {% endif %}
 
         <!-- SKU -->
         {% if p.sku %}
@@ -410,7 +437,7 @@
           {% endif %}
 
           <!-- Detail link -->
-          <a href="/product/{{ p.id }}" class="btn btn-outline-primary btn-sm w-100 mt-2">
+          <a href="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}" class="btn btn-outline-primary btn-sm w-100 mt-2">
             <i class="bi bi-eye me-1"></i>View Details
           </a>
         </div>
@@ -428,7 +455,7 @@
     <!-- Previous -->
     <li class="page-item {% if page <= 1 %}disabled{% endif %}">
       <a class="page-link"
-         href="/search?q={{ query | urlencode }}&page={{ page - 1 }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
+         href="/search?db_id={{ db_id }}&q={{ query | urlencode }}&page={{ page - 1 }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
          onclick="showLoading()">
         <i class="bi bi-chevron-left"></i>
       </a>
@@ -441,7 +468,7 @@
     {% if start_page > 1 %}
     <li class="page-item">
       <a class="page-link"
-         href="/search?q={{ query | urlencode }}&page=1&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
+         href="/search?db_id={{ db_id }}&q={{ query | urlencode }}&page=1&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
          onclick="showLoading()">1</a>
     </li>
     {% if start_page > 2 %}
@@ -452,7 +479,7 @@
     {% for p_num in range(start_page, end_page + 1) %}
     <li class="page-item {% if p_num == page %}active{% endif %}">
       <a class="page-link"
-         href="/search?q={{ query | urlencode }}&page={{ p_num }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
+         href="/search?db_id={{ db_id }}&q={{ query | urlencode }}&page={{ p_num }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
          onclick="showLoading()">{{ p_num }}</a>
     </li>
     {% endfor %}
@@ -463,7 +490,7 @@
     {% endif %}
     <li class="page-item">
       <a class="page-link"
-         href="/search?q={{ query | urlencode }}&page={{ total_pages }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
+         href="/search?db_id={{ db_id }}&q={{ query | urlencode }}&page={{ total_pages }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
          onclick="showLoading()">{{ total_pages }}</a>
     </li>
     {% endif %}
@@ -471,7 +498,7 @@
     <!-- Next -->
     <li class="page-item {% if page >= total_pages %}disabled{% endif %}">
       <a class="page-link"
-         href="/search?q={{ query | urlencode }}&page={{ page + 1 }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
+         href="/search?db_id={{ db_id }}&q={{ query | urlencode }}&page={{ page + 1 }}&limit={{ limit }}&sort={{ sort }}&category={{ category | urlencode }}&min_price={{ min_price }}&max_price={{ max_price }}"
          onclick="showLoading()">
         <i class="bi bi-chevron-right"></i>
       </a>
@@ -561,6 +588,7 @@
     const detectedLabel = document.getElementById("img-detected-label");
     const btnClear    = document.getElementById("btn-clear-image");
     const searchInput = document.getElementById("searchInput");
+    const currentDbId = {{ db_id | int }};
 
     if (!btnImg) return;
 
@@ -636,7 +664,7 @@
     if (btnClear) {
       btnClear.addEventListener("click", () => {
         clearSession();
-        window.location.href = "/search";
+        window.location.href = `/search?db_id=${currentDbId}`;
       });
     }
 
@@ -675,6 +703,7 @@
         // POST to image search API — field name "image"
         const formData = new FormData();
         formData.append("image", file);
+        formData.append("db_id", String(currentDbId));
 
         const resp = await fetch("/api/image-search", {
           method: "POST",
@@ -711,7 +740,7 @@
         // Redirect — search bar stays EMPTY, img=1 suppresses "Did You Mean"
         showLoading();
         window.location.href =
-          `/search?q=${encodeURIComponent(generatedQuery)}&img=1`;
+          `/search?db_id=${currentDbId}&q=${encodeURIComponent(generatedQuery)}&img=1`;
 
       } catch (err) {
         setStatus(

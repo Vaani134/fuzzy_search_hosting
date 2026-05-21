@@ -3,316 +3,734 @@
 
 {% block extra_head %}
 <style>
-  .settings-card {
-    max-width: 640px;
-    margin: 0 auto;
+  /* ── Database cards ── */
+  .db-card { border-radius: .75rem; transition: box-shadow .2s; }
+  .db-card:hover { box-shadow: 0 4px 20px rgba(0,0,0,.08) !important; }
+
+  .db-status-badge {
+    display: inline-flex; align-items: center; gap: .3rem;
+    padding: .2rem .65rem; border-radius: 999px;
+    font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
   }
-  .field-label {
-    font-weight: 600;
-    font-size: .85rem;
-    color: #374151;
-    margin-bottom: .3rem;
-  }
-  .field-hint {
-    font-size: .75rem;
-    color: #9ca3af;
-    margin-top: .25rem;
-  }
-  .conn-result {
-    border-radius: .5rem;
-    padding: .75rem 1rem;
-    font-size: .875rem;
-    display: none;
-  }
-  .conn-result.success { background: #f0fdf4; border: 1px solid #86efac; color: #166534; }
-  .conn-result.error   { background: #fef2f2; border: 1px solid #fca5a5; color: #991b1b; }
-  .conn-result.testing { background: #eff6ff; border: 1px solid #93c5fd; color: #1e40af; }
-  .save-result {
-    font-size: .85rem;
-    display: none;
-  }
-  /* Password toggle */
-  .pw-wrapper { position: relative; }
+  .badge-never   { background: #f1f5f9; color: #64748b; }
+  .badge-running { background: #dbeafe; color: #1d4ed8; }
+  .badge-ok      { background: #dcfce7; color: #166534; }
+  .badge-error   { background: #fee2e2; color: #991b1b; }
+  .badge-stopped { background: #fef9c3; color: #92400e; }
+
+  .db-meta { font-size: .8rem; color: #6b7280; }
+  .db-meta code { font-size: .78rem; background: #f3f4f6; padding: .1rem .35rem; border-radius: .25rem; }
+  .db-inline-label { font-size: .72rem; font-weight: 600; color: #6b7280; text-transform: uppercase; letter-spacing: .04em; }
+
+  /* ── Modal form ── */
+  .field-label { font-weight: 600; font-size: .85rem; color: #374151; margin-bottom: .3rem; }
+  .field-hint  { font-size: .75rem; color: #9ca3af; margin-top: .25rem; }
+  .pw-wrapper  { position: relative; }
   .pw-toggle {
-    position: absolute;
-    right: .75rem; top: 50%;
+    position: absolute; right: .75rem; top: 50%;
     transform: translateY(-50%);
-    background: none; border: none;
-    color: #9ca3af; cursor: pointer;
-    padding: 0; font-size: 1rem;
-    line-height: 1;
+    background: none; border: none; color: #9ca3af; cursor: pointer; font-size: 1rem;
   }
   .pw-toggle:hover { color: #374151; }
+
+  /* ── Inline status strip ── */
+  .conn-result {
+    border-radius: .5rem; padding: .65rem .9rem;
+    font-size: .82rem; display: none;
+  }
+  .conn-result.success { background:#f0fdf4; border:1px solid #86efac; color:#166534; }
+  .conn-result.error   { background:#fef2f2; border:1px solid #fca5a5; color:#991b1b; }
+  .conn-result.testing { background:#eff6ff; border:1px solid #93c5fd; color:#1e40af; }
+
+  .add-db-card {
+    border: 2px dashed #d1d5db; border-radius: .75rem;
+    cursor: pointer; min-height: 160px;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    color: #9ca3af; transition: border-color .2s, color .2s;
+  }
+  .add-db-card:hover { border-color: #2563eb; color: #2563eb; }
 </style>
 {% endblock %}
 
 {% block content %}
 
-<div class="settings-card">
+<div class="d-flex justify-content-between align-items-center mb-1">
+  <h2 class="fw-bold mb-0">
+    <i class="bi bi-gear text-primary me-2"></i>Connected Databases
+  </h2>
+  <button class="btn btn-primary btn-sm" onclick="openAddModal()">
+    <i class="bi bi-plus-lg me-1"></i>Add Database
+  </button>
+</div>
+<p class="text-muted mb-4">
+  Manage MySQL/ERP source databases. Each card represents one sync source.
+  Data is synced incrementally into the local SQLite cache.
+</p>
 
-  <!-- ── Header ── -->
-  <div class="mb-4">
-    <h2 class="fw-bold mb-0">
-      <i class="bi bi-gear text-primary me-2"></i>Database Settings
-    </h2>
-    <p class="text-muted mt-1">
-      Configure the MySQL connection used for syncing ERP data into SQLite.
-      Changes are saved to <code>db_settings.json</code> and take effect immediately.
-    </p>
+<!-- ── Database cards grid ── -->
+<div class="row g-3 mb-4" id="db-grid">
+  <div class="col-12 text-muted text-center py-5" id="db-loading">
+    <span class="spinner-border spinner-border-sm me-2"></span>Loading databases…
   </div>
+</div>
 
-  <!-- ── Form card ── -->
-  <div class="card shadow-sm border-0">
-    <div class="card-body p-4">
-
-      <form id="settings-form" autocomplete="off" onsubmit="return false;">
-
-        <!-- Host -->
-        <div class="mb-3">
-          <div class="field-label">Database Host</div>
-          <input
-            type="text"
-            id="f-host"
-            class="form-control"
-            placeholder="127.0.0.1"
-            value="{{ settings.host }}"
-            spellcheck="false"
-          />
-          <div class="field-hint">IP address or hostname of the MySQL server.</div>
+<!-- ── Legacy single-DB settings (kept for backward compatibility) ── -->
+<div class="card border-0 shadow-sm mt-2">
+  <div class="card-body">
+    <h6 class="fw-bold mb-1">
+      <i class="bi bi-arrow-repeat text-warning me-2"></i>Legacy Connection Settings
+    </h6>
+    <p class="text-muted small mb-3">
+      These settings update <code>db_settings.json</code> and the primary database
+      (id&nbsp;=&nbsp;1) simultaneously, preserving backward compatibility.
+    </p>
+    <form id="legacy-form" autocomplete="off" onsubmit="return false;">
+      <div class="row g-3">
+        <div class="col-md-6">
+          <div class="field-label">Host</div>
+          <input type="text" id="lf-host" class="form-control form-control-sm"
+                 value="{{ settings.host }}" spellcheck="false"/>
         </div>
-
-        <!-- Port -->
-        <div class="mb-3">
-          <div class="field-label">Database Port</div>
-          <input
-            type="number"
-            id="f-port"
-            class="form-control"
-            placeholder="3306"
-            value="{{ settings.port }}"
-            min="1" max="65535"
-            style="max-width: 160px;"
-          />
-          <div class="field-hint">Default MySQL port is 3306.</div>
+        <div class="col-md-2">
+          <div class="field-label">Port</div>
+          <input type="number" id="lf-port" class="form-control form-control-sm"
+                 value="{{ settings.port }}" min="1" max="65535"/>
         </div>
-
-        <!-- Database name -->
-        <div class="mb-3">
+        <div class="col-md-4">
           <div class="field-label">Database Name</div>
-          <input
-            type="text"
-            id="f-database"
-            class="form-control"
-            placeholder="cloudbbtl_novx"
-            value="{{ settings.database }}"
-            spellcheck="false"
-          />
-          <div class="field-hint">The MySQL database / schema name.</div>
+          <input type="text" id="lf-database" class="form-control form-control-sm"
+                 value="{{ settings.database }}" spellcheck="false"/>
         </div>
-
-        <!-- Username -->
-        <div class="mb-3">
-          <div class="field-label">Database Username</div>
-          <input
-            type="text"
-            id="f-user"
-            class="form-control"
-            placeholder="root"
-            value="{{ settings.user }}"
-            autocomplete="off"
-            spellcheck="false"
-          />
+        <div class="col-md-4">
+          <div class="field-label">Username</div>
+          <input type="text" id="lf-user" class="form-control form-control-sm"
+                 value="{{ settings.user }}" autocomplete="off"/>
         </div>
-
-        <!-- Password -->
-        <div class="mb-4">
-          <div class="field-label">Database Password</div>
+        <div class="col-md-4">
+          <div class="field-label">Password</div>
           <div class="pw-wrapper">
-            <input
-              type="password"
-              id="f-password"
-              class="form-control pe-5"
-              placeholder="Leave blank to keep current password"
-              autocomplete="new-password"
-            />
-            <button type="button" class="pw-toggle" onclick="togglePassword()" id="pw-eye">
-              <i class="bi bi-eye" id="pw-eye-icon"></i>
+            <input type="password" id="lf-password" class="form-control form-control-sm pe-5"
+                   placeholder="Leave blank to keep current"/>
+            <button type="button" class="pw-toggle" onclick="togglePw('lf-password','lf-pw-icon')">
+              <i class="bi bi-eye" id="lf-pw-icon"></i>
             </button>
           </div>
-          <div class="field-hint">
-            Leave blank to keep the currently saved password.
-            Current password: <span id="pw-status">
-              {% if settings.password %}set (hidden){% else %}not set{% endif %}
-            </span>
+        </div>
+        <div class="col-md-4 d-flex align-items-end gap-2">
+          <button type="button" class="btn btn-primary btn-sm" onclick="saveLegacy()">
+            <i class="bi bi-floppy me-1"></i>Save
+          </button>
+          <button type="button" class="btn btn-outline-success btn-sm" onclick="testLegacy()">
+            <i class="bi bi-plug me-1"></i>Test
+          </button>
+        </div>
+      </div>
+    </form>
+    <div id="legacy-result" class="conn-result mt-3"></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     ADD / EDIT DATABASE MODAL
+════════════════════════════════════════════════════════════ -->
+<div class="modal fade" id="dbModal" tabindex="-1" aria-labelledby="dbModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content border-0 shadow">
+
+      <div class="modal-header border-0 pb-0">
+        <h5 class="modal-title fw-bold" id="dbModalLabel">Add Database</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+
+      <div class="modal-body pt-3">
+        <input type="hidden" id="m-db-id" value=""/>
+
+        <div class="row g-3">
+          <!-- Display name -->
+          <div class="col-12">
+            <div class="field-label">Display Name <span class="text-danger">*</span></div>
+            <input type="text" id="m-name" class="form-control"
+                   placeholder="e.g. Main ERP — Branch A"/>
+            <div class="field-hint">A friendly label shown on the card.</div>
+          </div>
+
+          <!-- Host + Port -->
+          <div class="col-md-8">
+            <div class="field-label">Database Host <span class="text-danger">*</span></div>
+            <input type="text" id="m-host" class="form-control"
+                   placeholder="127.0.0.1 or db.example.com" spellcheck="false"/>
+          </div>
+          <div class="col-md-4">
+            <div class="field-label">Port</div>
+            <input type="number" id="m-port" class="form-control"
+                   placeholder="3306" value="3306" min="1" max="65535"/>
+          </div>
+
+          <!-- Database name -->
+          <div class="col-12">
+            <div class="field-label">Database Name <span class="text-danger">*</span></div>
+            <input type="text" id="m-database" class="form-control"
+                   placeholder="cloudbbtl_novx" spellcheck="false"/>
+          </div>
+
+          <div class="col-12">
+            <div class="field-label">Image Base URL</div>
+            <input type="url" id="m-image-base-url" class="form-control"
+                   placeholder="https://gothcloud.com" spellcheck="false"/>
+            <div class="field-hint">Optional. Example: https://gothcloud.com</div>
+          </div>
+
+          <!-- Username + Password -->
+          <div class="col-md-6">
+            <div class="field-label">Username</div>
+            <input type="text" id="m-username" class="form-control"
+                   placeholder="root" autocomplete="off" spellcheck="false"/>
+          </div>
+          <div class="col-md-6">
+            <div class="field-label">Password</div>
+            <div class="pw-wrapper">
+              <input type="password" id="m-password" class="form-control pe-5"
+                     placeholder="Leave blank to keep existing"
+                     autocomplete="new-password"/>
+              <button type="button" class="pw-toggle"
+                      onclick="togglePw('m-password','m-pw-icon')">
+                <i class="bi bi-eye" id="m-pw-icon"></i>
+              </button>
+            </div>
           </div>
         </div>
 
-        <!-- Action buttons -->
-        <div class="d-flex gap-2 flex-wrap">
-          <button type="button" class="btn btn-primary" onclick="saveSettings()" id="btn-save">
-            <i class="bi bi-floppy me-1"></i>Save Settings
-          </button>
-          <button type="button" class="btn btn-outline-success" onclick="testConnection()" id="btn-test">
-            <i class="bi bi-plug me-1"></i>Test Connection
-          </button>
-          <button type="button" class="btn btn-outline-secondary" onclick="resetForm()">
-            <i class="bi bi-arrow-counterclockwise me-1"></i>Reset
-          </button>
-        </div>
+        <!-- Connection test result -->
+        <div id="m-conn-result" class="conn-result mt-3"></div>
+      </div>
 
-      </form>
-
-      <!-- Save result -->
-      <div id="save-result" class="save-result mt-3"></div>
-
-    </div>
-  </div>
-
-  <!-- ── Connection test result ── -->
-  <div id="conn-result" class="conn-result mt-3">
-    <div class="d-flex align-items-start gap-2">
-      <i id="conn-icon" class="bi fs-5 mt-0"></i>
-      <div>
-        <div id="conn-message" class="fw-semibold"></div>
-        <div id="conn-detail"  class="mt-1 small"></div>
+      <div class="modal-footer border-0 pt-0">
+        <button type="button" class="btn btn-outline-success btn-sm me-auto"
+                onclick="testModalConn()">
+          <i class="bi bi-plug me-1"></i>Test Connection
+        </button>
+        <button type="button" class="btn btn-outline-secondary btn-sm"
+                data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary btn-sm" id="m-save-btn"
+                onclick="saveModal()">
+          <i class="bi bi-floppy me-1"></i>Save
+        </button>
       </div>
     </div>
   </div>
-
-  <!-- ── Current saved config (read-only display) ── -->
-  <div class="card mt-4 border-0 shadow-sm">
-    <div class="card-body">
-      <h6 class="fw-bold mb-3">
-        <i class="bi bi-info-circle text-primary me-2"></i>Currently Saved Configuration
-      </h6>
-      <table class="table table-sm mb-0">
-        <tbody>
-          <tr><th class="bg-light w-40">Host</th>     <td><code>{{ settings.host }}</code></td></tr>
-          <tr><th class="bg-light">Port</th>           <td><code>{{ settings.port }}</code></td></tr>
-          <tr><th class="bg-light">Database</th>       <td><code>{{ settings.database }}</code></td></tr>
-          <tr><th class="bg-light">Username</th>       <td><code>{{ settings.user }}</code></td></tr>
-          <tr><th class="bg-light">Password</th>
-              <td>{% if settings.password %}<span class="text-muted">set (hidden)</span>{% else %}<span class="text-muted">not set</span>{% endif %}</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
 </div>
 
 {% endblock %}
 
 {% block extra_scripts %}
 <script>
-  // ── Helpers ────────────────────────────────────────────────────────────────
-  function getFormValues() {
-    return {
-      host:     document.getElementById("f-host").value.trim(),
-      port:     document.getElementById("f-port").value.trim(),
-      database: document.getElementById("f-database").value.trim(),
-      user:     document.getElementById("f-user").value.trim(),
-      password: document.getElementById("f-password").value,   // may be blank
-    };
+// ═══════════════════════════════════════════════════════════════════════════════
+// SETTINGS PAGE — Connected Database Management
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Status badge helper ────────────────────────────────────────────────────────
+function statusBadge(status) {
+  const map = {
+    never:   ["badge-never",   "bi-circle",             "Never synced"],
+    running: ["badge-running", "bi-arrow-repeat",       "Syncing…"],
+    ok:      ["badge-ok",      "bi-check-circle-fill",  "Synced OK"],
+    error:   ["badge-error",   "bi-x-circle-fill",      "Error"],
+    stopped: ["badge-stopped", "bi-pause-circle-fill",  "Stopped"],
+  };
+  const [cls, icon, label] = map[status] || ["badge-never","bi-circle","Unknown"];
+  const spin = status === "running"
+    ? '<span class="spinner-border spinner-border-sm" style="width:.65rem;height:.65rem;"></span>'
+    : `<i class="bi ${icon}"></i>`;
+  return `<span class="db-status-badge ${cls}">${spin} ${label}</span>`;
+}
+
+function fmtDate(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleString([], {
+    month: "short", day: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  });
+}
+
+// ── Build one database card ────────────────────────────────────────────────────
+function buildCard(db, liveState) {
+  const live    = liveState || {};
+  const running = live.running || db.sync_status === "running";
+  const status  = running ? "running" : db.sync_status;
+
+  return `
+    <div class="col-md-6 col-xl-4">
+      <div class="card db-card shadow-sm border-0 h-100" id="db-card-${db.id}">
+        <div class="card-body d-flex flex-column gap-2">
+
+          <!-- Header row -->
+          <div class="d-flex justify-content-between align-items-start">
+            <div>
+              <div class="fw-bold fs-6">${escHtml(db.name)}</div>
+              <div class="db-meta mt-1">
+                <i class="bi bi-database me-1"></i>
+                <code>${escHtml(db.host)}:${db.port}</code>
+                /
+                <code>${escHtml(db.database_name)}</code>
+              </div>
+            </div>
+            <div class="d-flex gap-1">
+              <button class="btn btn-sm btn-outline-secondary p-1 lh-1"
+                      title="Edit" onclick="openEditModal(${db.id})">
+                <i class="bi bi-pencil"></i>
+              </button>
+              <button class="btn btn-sm btn-outline-danger p-1 lh-1"
+                      title="Delete" onclick="deleteDb(${db.id}, '${escHtml(db.name)}')">
+                <i class="bi bi-trash"></i>
+              </button>
+            </div>
+          </div>
+
+          <!-- Status row -->
+          <div class="d-flex align-items-center gap-2 flex-wrap">
+            ${statusBadge(status)}
+            <span class="db-meta">
+              Last sync: ${fmtDate(db.last_sync_at)}
+            </span>
+          </div>
+
+          <!-- Progress bar (visible only while running) -->
+          <div id="progress-bar-${db.id}" class="${running ? '' : 'd-none'}">
+            <div class="progress" style="height:5px;">
+              <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary"
+                   style="width:${live.progress || 30}%"></div>
+            </div>
+            <small class="text-muted" id="current-table-${db.id}">
+              ${live.current_table ? `Syncing ${live.current_table}…` : 'Preparing…'}
+            </small>
+          </div>
+
+          <!-- Image base URL -->
+          <div class="mt-1">
+            <div class="db-inline-label mb-1">Image Base URL</div>
+            <div class="input-group input-group-sm">
+              <input type="url" class="form-control"
+                     id="img-base-${db.id}"
+                     placeholder="https://gothcloud.com"
+                     value="${escHtml(db.image_base_url || '')}">
+              <button class="btn btn-outline-secondary" type="button"
+                      onclick="saveImageBaseUrl(${db.id})" title="Save image URL">
+                <i class="bi bi-floppy"></i>
+              </button>
+            </div>
+          </div>
+
+          <!-- Action buttons -->
+          <div class="d-flex gap-2 mt-auto pt-1">
+            <button class="btn btn-success btn-sm ${running ? 'disabled' : ''}"
+                    id="sync-btn-${db.id}"
+                    onclick="startSync(${db.id}, false)">
+              <i class="bi bi-play-fill me-1"></i>Sync
+            </button>
+            <button class="btn btn-outline-primary btn-sm ${running ? 'disabled' : ''}"
+                    id="full-sync-btn-${db.id}"
+                    onclick="startSync(${db.id}, true)">
+              <i class="bi bi-database-fill-down me-1"></i>Full Sync
+            </button>
+            <button class="btn btn-warning btn-sm ${running ? '' : 'disabled'}"
+                    id="stop-btn-${db.id}"
+                    onclick="stopSync(${db.id})">
+              <i class="bi bi-stop-fill me-1"></i>Stop
+            </button>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ── Load and render all database cards ────────────────────────────────────────
+let _liveStates = {};
+let _databases  = [];
+
+async function loadDatabases() {
+  const grid = document.getElementById("db-grid");
+  try {
+    const [dbResp, liveResp] = await Promise.all([
+      fetch("/api/databases"),
+      fetch("/api/databases/live"),
+    ]);
+    _databases  = await dbResp.json();
+    _liveStates = await liveResp.json();
+
+    if (!_databases.length) {
+      grid.innerHTML = `
+        <div class="col-12">
+          <div class="add-db-card" onclick="openAddModal()">
+            <i class="bi bi-plus-circle fs-1 mb-2"></i>
+            <div class="fw-semibold">No databases connected</div>
+            <div class="small">Click to add your first ERP database</div>
+          </div>
+        </div>`;
+      return;
+    }
+
+    let html = _databases.map(db =>
+      buildCard(db, _liveStates[db.id])
+    ).join("");
+
+    // "Add" tile at the end
+    html += `
+      <div class="col-md-6 col-xl-4">
+        <div class="add-db-card h-100" onclick="openAddModal()">
+          <i class="bi bi-plus-circle fs-2 mb-2"></i>
+          <div class="fw-semibold">Add Database</div>
+        </div>
+      </div>`;
+
+    grid.innerHTML = html;
+  } catch (e) {
+    grid.innerHTML = `<div class="col-12 text-danger"><i class="bi bi-x-circle me-1"></i>
+      Failed to load databases: ${e.message}</div>`;
+  }
+}
+
+// ── Live polling (every 3s while any DB is running) ────────────────────────────
+let _pollTimer = null;
+
+async function pollLive() {
+  try {
+    const resp = await fetch("/api/databases/live");
+    _liveStates = await resp.json();
+
+    // Update each running card in-place (avoid full re-render for stability)
+    _databases.forEach(db => {
+      const live = _liveStates[db.id] || {};
+      const running = live.running;
+
+      const bar  = document.getElementById(`progress-bar-${db.id}`);
+      const tbl  = document.getElementById(`current-table-${db.id}`);
+      const sBtn = document.getElementById(`sync-btn-${db.id}`);
+      const fBtn = document.getElementById(`full-sync-btn-${db.id}`);
+      const xBtn = document.getElementById(`stop-btn-${db.id}`);
+
+      if (!bar) return;
+
+      if (running) {
+        bar.classList.remove("d-none");
+        if (tbl) tbl.textContent = live.current_table ? `Syncing ${live.current_table}…` : "Preparing…";
+        if (sBtn) sBtn.classList.add("disabled");
+        if (fBtn) fBtn.classList.add("disabled");
+        if (xBtn) xBtn.classList.remove("disabled");
+      } else {
+        bar.classList.add("d-none");
+        if (sBtn) sBtn.classList.remove("disabled");
+        if (fBtn) fBtn.classList.remove("disabled");
+        if (xBtn) xBtn.classList.add("disabled");
+
+        // If we just finished, reload cards to update status badge + last sync time
+        if (live.finished_at && live._polled) {
+          loadDatabases();
+          return;
+        }
+        if (live.finished_at) live._polled = true;
+      }
+    });
+
+    // Slow poll when nothing is running; fast poll when something is active
+    const anyRunning = Object.values(_liveStates).some(s => s.running);
+    clearInterval(_pollTimer);
+    _pollTimer = setInterval(pollLive, anyRunning ? 2500 : 10000);
+  } catch { /* network hiccup — keep polling */ }
+}
+
+// ── Sync control buttons ───────────────────────────────────────────────────────
+async function startSync(dbId, full) {
+  const sBtn = document.getElementById(`sync-btn-${dbId}`);
+  const fBtn = document.getElementById(`full-sync-btn-${dbId}`);
+  if (sBtn) sBtn.classList.add("disabled");
+  if (fBtn) fBtn.classList.add("disabled");
+
+  try {
+    const resp = await fetch(`/api/database/${dbId}/sync`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ full }),
+    });
+    const data = await resp.json();
+    if (data.status === "already_running") {
+      alert("A sync is already running for this database.");
+      if (sBtn) sBtn.classList.remove("disabled");
+      if (fBtn) fBtn.classList.remove("disabled");
+      return;
+    }
+    // Start fast polling
+    clearInterval(_pollTimer);
+    _pollTimer = setInterval(pollLive, 2500);
+    pollLive();
+  } catch (e) {
+    alert("Failed to start sync: " + e.message);
+    if (sBtn) sBtn.classList.remove("disabled");
+    if (fBtn) fBtn.classList.remove("disabled");
+  }
+}
+
+async function stopSync(dbId) {
+  try {
+    const resp = await fetch(`/api/database/${dbId}/stop`, { method: "POST" });
+    const data = await resp.json();
+    if (!data.ok) alert(data.message);
+  } catch (e) {
+    alert("Failed to request stop: " + e.message);
+  }
+}
+
+async function deleteDb(dbId, name) {
+  if (!confirm(`Delete database "${name}"?\nThis cannot be undone.`)) return;
+  try {
+    const resp = await fetch(`/api/database/${dbId}`, { method: "DELETE" });
+    const data = await resp.json();
+    if (!resp.ok) { alert(data.error); return; }
+    loadDatabases();
+  } catch (e) {
+    alert("Delete failed: " + e.message);
+  }
+}
+
+// ── Add / Edit modal ───────────────────────────────────────────────────────────
+const _modal = new bootstrap.Modal(document.getElementById("dbModal"));
+
+function openAddModal() {
+  document.getElementById("dbModalLabel").textContent = "Add Database";
+  document.getElementById("m-db-id").value    = "";
+  document.getElementById("m-name").value     = "";
+  document.getElementById("m-host").value     = "";
+  document.getElementById("m-port").value     = "3306";
+  document.getElementById("m-database").value = "";
+  document.getElementById("m-image-base-url").value = "";
+  document.getElementById("m-username").value = "";
+  document.getElementById("m-password").value = "";
+  document.getElementById("m-conn-result").style.display = "none";
+  _modal.show();
+}
+
+async function openEditModal(dbId) {
+  document.getElementById("dbModalLabel").textContent = "Edit Database";
+  document.getElementById("m-conn-result").style.display = "none";
+
+  const resp = await fetch(`/api/database/${dbId}`);
+  if (!resp.ok) { alert("Failed to load database settings."); return; }
+  const db = await resp.json();
+
+  document.getElementById("m-db-id").value    = db.id;
+  document.getElementById("m-name").value     = db.name || "";
+  document.getElementById("m-host").value     = db.host || "";
+  document.getElementById("m-port").value     = db.port || "3306";
+  document.getElementById("m-database").value = db.database_name || "";
+  document.getElementById("m-image-base-url").value = db.image_base_url || "";
+  document.getElementById("m-username").value = db.username || "";
+  document.getElementById("m-password").value = "";   // never pre-fill password
+  _modal.show();
+}
+
+function getModalValues() {
+  return {
+    name:          document.getElementById("m-name").value.trim(),
+    host:          document.getElementById("m-host").value.trim(),
+    port:          parseInt(document.getElementById("m-port").value) || 3306,
+    database_name: document.getElementById("m-database").value.trim(),
+    image_base_url: document.getElementById("m-image-base-url").value.trim(),
+    username:      document.getElementById("m-username").value.trim(),
+    password:      document.getElementById("m-password").value,
+  };
+}
+
+async function saveImageBaseUrl(dbId) {
+  const input = document.getElementById(`img-base-${dbId}`);
+  if (!input) return;
+  input.disabled = true;
+  try {
+    const resp = await fetch(`/api/database/${dbId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image_base_url: input.value.trim() }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      alert(data.error || "Failed to save image base URL.");
+      return;
+    }
+  } catch (e) {
+    alert("Failed to save image base URL: " + e.message);
+  } finally {
+    input.disabled = false;
+  }
+}
+
+async function saveModal() {
+  const btn = document.getElementById("m-save-btn");
+  const dbId = document.getElementById("m-db-id").value;
+  const vals = getModalValues();
+
+  if (!vals.name || !vals.host || !vals.database_name) {
+    alert("Name, Host, and Database Name are required.");
+    return;
   }
 
-  function togglePassword() {
-    const inp  = document.getElementById("f-password");
-    const icon = document.getElementById("pw-eye-icon");
-    if (inp.type === "password") {
-      inp.type = "text";
-      icon.className = "bi bi-eye-slash";
+  const origHTML = btn.innerHTML;
+  btn.disabled  = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Saving…';
+
+  try {
+    let resp;
+    if (dbId) {
+      resp = await fetch(`/api/database/${dbId}`, {
+        method:  "PUT",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(vals),
+      });
     } else {
-      inp.type = "password";
-      icon.className = "bi bi-eye";
-    }
-  }
-
-  function resetForm() {
-    location.reload();
-  }
-
-  // ── Save settings ──────────────────────────────────────────────────────────
-  async function saveSettings() {
-    const btn  = document.getElementById("btn-save");
-    const orig = btn.innerHTML;
-    btn.disabled  = true;
-    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Saving…';
-
-    const resultEl = document.getElementById("save-result");
-    resultEl.style.display = "none";
-
-    try {
-      const resp = await fetch("/api/settings", {
+      resp = await fetch("/api/databases", {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify(getFormValues()),
+        body:    JSON.stringify(vals),
       });
-      const data = await resp.json();
-
-      if (resp.ok) {
-        resultEl.innerHTML = `<span class="text-success"><i class="bi bi-check-circle me-1"></i>${data.message}</span>`;
-        // Reload page to refresh the "Currently Saved" table
-        setTimeout(() => location.reload(), 800);
-      } else {
-        resultEl.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle me-1"></i>${data.error || "Save failed"}</span>`;
-      }
-    } catch (e) {
-      resultEl.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle me-1"></i>${e.message}</span>`;
-    } finally {
-      resultEl.style.display = "block";
-      btn.innerHTML = orig;
-      btn.disabled  = false;
     }
+    const data = await resp.json();
+    if (!resp.ok) { alert(data.error || "Save failed."); return; }
+
+    _modal.hide();
+    loadDatabases();
+  } catch (e) {
+    alert("Save failed: " + e.message);
+  } finally {
+    btn.innerHTML = origHTML;
+    btn.disabled  = false;
   }
+}
 
-  // ── Test connection ────────────────────────────────────────────────────────
-  async function testConnection() {
-    const btn  = document.getElementById("btn-test");
-    const orig = btn.innerHTML;
-    btn.disabled  = true;
-    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Testing…';
+async function testModalConn() {
+  const dbId = document.getElementById("m-db-id").value;
+  const box  = document.getElementById("m-conn-result");
 
-    const box     = document.getElementById("conn-result");
-    const icon    = document.getElementById("conn-icon");
-    const message = document.getElementById("conn-message");
-    const detail  = document.getElementById("conn-detail");
+  box.className    = "conn-result testing";
+  box.style.display = "block";
+  box.innerHTML    = '<i class="bi bi-hourglass-split me-1"></i>Testing connection…';
 
-    // Show "testing" state
-    box.className = "conn-result testing";
-    box.style.display = "block";
-    icon.className    = "bi bi-hourglass-split fs-5 mt-0";
-    message.textContent = "Testing connection…";
-    detail.textContent  = "";
-
-    try {
-      const resp = await fetch("/api/settings/test", {
+  try {
+    let resp, data;
+    if (dbId) {
+      // Saved DB: test using stored credentials
+      resp = await fetch(`/api/database/${dbId}/test`, { method: "POST" });
+      data = await resp.json();
+    } else {
+      // Unsaved: test using legacy endpoint with form values
+      const v = getModalValues();
+      resp = await fetch("/api/settings/test", {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify(getFormValues()),
+        body:    JSON.stringify({
+          host: v.host, port: v.port,
+          database: v.database_name,
+          user: v.username, password: v.password,
+        }),
       });
-      const data = await resp.json();
-
-      if (data.ok) {
-        box.className     = "conn-result success";
-        icon.className    = "bi bi-check-circle-fill fs-5 mt-0";
-        message.textContent = data.message;
-        detail.textContent  = data.detail;
-      } else {
-        box.className     = "conn-result error";
-        icon.className    = "bi bi-x-circle-fill fs-5 mt-0";
-        message.textContent = data.message;
-        detail.textContent  = data.detail;
-      }
-    } catch (e) {
-      box.className     = "conn-result error";
-      icon.className    = "bi bi-x-circle-fill fs-5 mt-0";
-      message.textContent = "Request failed";
-      detail.textContent  = e.message;
-    } finally {
-      btn.innerHTML = orig;
-      btn.disabled  = false;
+      data = await resp.json();
     }
+
+    if (data.ok) {
+      box.className = "conn-result success";
+      box.innerHTML = `<i class="bi bi-check-circle-fill me-1"></i>
+        <strong>${data.message}</strong><br><small>${data.detail}</small>`;
+    } else {
+      box.className = "conn-result error";
+      box.innerHTML = `<i class="bi bi-x-circle-fill me-1"></i>
+        <strong>${data.message}</strong><br><small>${data.detail}</small>`;
+    }
+  } catch (e) {
+    box.className = "conn-result error";
+    box.innerHTML = `<i class="bi bi-x-circle-fill me-1"></i>Request failed: ${e.message}`;
   }
+}
+
+// ── Legacy form (DB id=1 / db_settings.json) ──────────────────────────────────
+function togglePw(inputId, iconId) {
+  const inp  = document.getElementById(inputId);
+  const icon = document.getElementById(iconId);
+  if (inp.type === "password") {
+    inp.type = "text";
+    icon.className = "bi bi-eye-slash";
+  } else {
+    inp.type = "password";
+    icon.className = "bi bi-eye";
+  }
+}
+
+async function saveLegacy() {
+  const result = document.getElementById("legacy-result");
+  result.style.display = "none";
+  const payload = {
+    host:     document.getElementById("lf-host").value.trim(),
+    port:     document.getElementById("lf-port").value.trim(),
+    database: document.getElementById("lf-database").value.trim(),
+    user:     document.getElementById("lf-user").value.trim(),
+    password: document.getElementById("lf-password").value,
+  };
+  try {
+    const resp = await fetch("/api/settings", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    result.className  = `conn-result ${resp.ok ? "success" : "error"}`;
+    result.style.display = "block";
+    result.innerHTML  = `<i class="bi bi-${resp.ok ? "check" : "x"}-circle me-1"></i>${data.message || data.error}`;
+    if (resp.ok) loadDatabases();
+  } catch (e) {
+    result.className  = "conn-result error";
+    result.style.display = "block";
+    result.innerHTML  = `<i class="bi bi-x-circle me-1"></i>${e.message}`;
+  }
+}
+
+async function testLegacy() {
+  const result = document.getElementById("legacy-result");
+  result.className  = "conn-result testing";
+  result.style.display = "block";
+  result.innerHTML  = '<i class="bi bi-hourglass-split me-1"></i>Testing…';
+  const payload = {
+    host:     document.getElementById("lf-host").value.trim(),
+    port:     document.getElementById("lf-port").value.trim(),
+    database: document.getElementById("lf-database").value.trim(),
+    user:     document.getElementById("lf-user").value.trim(),
+    password: document.getElementById("lf-password").value,
+  };
+  try {
+    const resp = await fetch("/api/settings/test", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    result.className  = `conn-result ${data.ok ? "success" : "error"}`;
+    result.innerHTML  = `<i class="bi bi-${data.ok ? "check" : "x"}-circle me-1"></i>
+      <strong>${data.message}</strong><br><small>${data.detail}</small>`;
+  } catch (e) {
+    result.className  = "conn-result error";
+    result.innerHTML  = `<i class="bi bi-x-circle me-1"></i>${e.message}`;
+  }
+}
+
+// ── XSS-safe HTML escaping ────────────────────────────────────────────────────
+function escHtml(str) {
+  if (!str) return "";
+  return String(str)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", () => {
+  loadDatabases();
+  _pollTimer = setInterval(pollLive, 10000);
+});
 </script>
 {% endblock %}

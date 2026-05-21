@@ -35,7 +35,7 @@ def list_databases() -> list:
         rows = conn.execute(
             """
             SELECT id, name, host, port, username, database_name,
-                   last_sync_at, sync_status, created_at, updated_at
+                   image_base_url, last_sync_at, sync_status, created_at, updated_at
             FROM connected_databases
             ORDER BY id
             """
@@ -78,6 +78,7 @@ def add_database(
     username: str,
     password: str,
     database_name: str,
+    image_base_url: str = "",
 ) -> int:
     """
     Insert a new connected database.
@@ -93,13 +94,13 @@ def add_database(
         cur = conn.execute(
             """
             INSERT INTO connected_databases
-                (name, host, port, username, password, database_name,
+                (name, host, port, username, password, database_name, image_base_url,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (name.strip(), host.strip(), int(port),
-             username.strip(), password,
-             database_name.strip(), now, now),
+             username.strip(), password, database_name.strip(),
+             (image_base_url or "").strip() or None, now, now),
         )
         conn.commit()
         return cur.lastrowid
@@ -110,10 +111,10 @@ def add_database(
 def update_database(db_id: int, **fields) -> bool:
     """
     Update one or more fields on a connected_database row.
-    Accepted fields: name, host, port, username, password, database_name.
+    Accepted fields: name, host, port, username, password, database_name, image_base_url.
     Returns True if a row was actually updated, False if not found.
     """
-    _allowed = {"name", "host", "port", "username", "password", "database_name"}
+    _allowed = {"name", "host", "port", "username", "password", "database_name", "image_base_url"}
     updates = {k: v for k, v in fields.items() if k in _allowed}
     if not updates:
         return False

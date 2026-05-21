@@ -13,6 +13,8 @@
   .status-running   { background:#dbeafe; color:#1d4ed8; }
   .status-ok        { background:#dcfce7; color:#166534; }
   .status-error     { background:#fee2e2; color:#991b1b; }
+  .status-stopped   { background:#fef3c7; color:#92400e; }
+  .status-skipped   { background:#f1f5f9; color:#94a3b8; }
 
   /* ── Progress bar ── */
   .sync-progress { height: 6px; border-radius: 3px; background:#e2e8f0; overflow:hidden; }
@@ -21,27 +23,60 @@
     background: linear-gradient(90deg, #2563eb, #60a5fa);
     transition: width .4s ease;
   }
-  .sync-progress-fill.done   { background: #16a34a; }
+  .sync-progress-fill.done    { background: #16a34a; }
   .sync-progress-fill.errored { background: #dc2626; }
+  .sync-progress-fill.stopped { background: #d97706; }
+  .sync-progress-fill.skipped { background: #cbd5e1; }
 
   /* ── Table rows ── */
   .sync-row td { vertical-align: middle; }
   .sync-row.row-running { background: #eff6ff; }
   .sync-row.row-ok      { background: #f0fdf4; }
   .sync-row.row-error   { background: #fef2f2; }
+  .sync-row.row-stopped { background: #fffbeb; }
+  .sync-row.row-skipped { background: #f8fafc; opacity: .75; }
 
   /* ── Live log console ── */
   #live-console {
     background: #0f172a; color: #94a3b8;
-    font-family: monospace; font-size: .78rem;
-    border-radius: .5rem; padding: .75rem 1rem;
-    max-height: 220px; overflow-y: auto;
-    line-height: 1.6;
+    font-family: "Cascadia Code", "Fira Code", "Courier New", monospace;
+    font-size: .77rem; border-radius: .5rem;
+    padding: .75rem 1rem; max-height: 300px;
+    overflow-y: auto; line-height: 1.7;
   }
+  #live-console .log-DEBUG   { color: #64748b; }
+  #live-console .log-INFO    { color: #94a3b8; }
+  #live-console .log-WARNING { color: #fbbf24; }
+  #live-console .log-ERROR   { color: #f87171; }
+  /* legacy class names kept for existing code */
   #live-console .log-ok      { color: #4ade80; }
   #live-console .log-error   { color: #f87171; }
   #live-console .log-running { color: #60a5fa; }
   #live-console .log-info    { color: #94a3b8; }
+
+  /* ── Stats strip ── */
+  .stats-strip {
+    display:flex; flex-wrap:wrap; gap:.75rem;
+    padding:.6rem 1rem; background:#f8fafc;
+    border-radius:.5rem; border:1px solid #e2e8f0;
+    font-size:.8rem;
+  }
+  .stats-strip .stat-item { display:flex; align-items:center; gap:.35rem; }
+  .stat-value { font-weight:700; }
+  .stat-value.green { color:#16a34a; }
+  .stat-value.red   { color:#dc2626; }
+  .stat-value.amber { color:#d97706; }
+  .stat-value.blue  { color:#2563eb; }
+
+  /* ── Error log panel ── */
+  #error-log-table { font-size:.78rem; }
+  .err-payload {
+    font-family: monospace; font-size:.73rem;
+    background:#1e293b; color:#94a3b8;
+    border-radius:.3rem; padding:.4rem .6rem;
+    white-space: pre-wrap; word-break: break-all;
+    max-height:150px; overflow-y:auto;
+  }
 
   /* ── History table ── */
   .history-ok    { color: #166534; }
@@ -59,7 +94,23 @@
     <i class="bi bi-circle-fill" style="font-size:.5rem;"></i> Idle
   </span>
 </div>
-<p class="text-muted mb-4">Fetch ERP data from MySQL and load it into the local SQLite cache.</p>
+<p class="text-muted mb-3">Fetch ERP data from MySQL and load it into the local SQLite cache.</p>
+
+<!-- ── Database selector ── -->
+<div class="card shadow-sm border-0 mb-4">
+  <div class="card-body py-2 px-3">
+    <div class="d-flex align-items-center gap-3 flex-wrap">
+      <label class="fw-semibold small text-nowrap mb-0">
+        <i class="bi bi-database text-primary me-1"></i>Sync target:
+      </label>
+      <select id="db-selector" class="form-select form-select-sm" style="max-width:320px;"
+              onchange="onDbChange()">
+        <option value="">Loading…</option>
+      </select>
+      <span id="db-status-pill" class="small text-muted"></span>
+    </div>
+  </div>
+</div>
 
 <!-- ── Action buttons ── -->
 <div class="row g-3 mb-4">
@@ -67,7 +118,7 @@
     <div class="card shadow-sm border-0 h-100">
       <div class="card-body">
         <h6 class="fw-semibold"><i class="bi bi-database-fill-down text-success me-2"></i>Full Sync</h6>
-        <p class="text-muted small mb-3">Truncates all local tables and reloads everything from MySQL.</p>
+        <p class="text-muted small mb-3">Removes this source's local rows and reimports everything from MySQL.</p>
         <button class="btn btn-success btn-sm" id="btnFullSync">
           <i class="bi bi-play-fill me-1"></i>Run Full Sync
         </button>
@@ -77,24 +128,48 @@
   <div class="col-md-4">
     <div class="card shadow-sm border-0 h-100">
       <div class="card-body">
-        <h6 class="fw-semibold"><i class="bi bi-lightning-fill text-primary me-2"></i>Rebuild Index</h6>
+        <h6 class="fw-semibold"><i class="bi bi-lightning-fill text-warning me-2"></i>Incremental Sync</h6>
+        <p class="text-muted small mb-3">Only fetches rows updated since the last successful sync. Much faster.</p>
+        <button class="btn btn-warning btn-sm" id="btnIncrSync">
+          <i class="bi bi-arrow-clockwise me-1"></i>Run Incremental
+        </button>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card shadow-sm border-0 h-100">
+      <div class="card-body">
+        <h6 class="fw-semibold"><i class="bi bi-stop-circle text-danger me-2"></i>Stop Sync</h6>
         <p class="text-muted small mb-3">
-          Drops the current in-memory index and rebuilds it fresh from SQLite.
-          Run this after a sync or any manual data change.
+          Gracefully stops after the current batch.
+          Progress is saved — next run resumes from the checkpoint.
         </p>
+        <button class="btn btn-danger btn-sm disabled" id="btnStop">
+          <i class="bi bi-stop-fill me-1"></i>Stop Sync
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
 
-        <!-- Live index status strip -->
+<!-- ── Rebuild index + last sync ── -->
+<div class="row g-3 mb-4">
+  <div class="col-md-8">
+    <div class="card shadow-sm border-0 h-100">
+      <div class="card-body">
+        <h6 class="fw-semibold"><i class="bi bi-lightning-fill text-primary me-2"></i>Rebuild Search Index</h6>
+        <p class="text-muted small mb-3">
+          Drops the in-memory index and rebuilds from SQLite.
+          Run after a sync or any manual data change.
+        </p>
         <div id="index-status-strip" class="d-flex align-items-center gap-2 mb-3 p-2 rounded"
              style="background:#f1f5f9; font-size:.8rem;">
           <i class="bi bi-database text-primary"></i>
           <span id="index-status-text" class="text-muted">Loading…</span>
         </div>
-
         <button class="btn btn-primary btn-sm" id="btnRebuild">
           <i class="bi bi-arrow-clockwise me-1"></i>Rebuild Index
         </button>
-
-        <!-- Result toast (shown inline after rebuild) -->
         <div id="rebuild-result" class="mt-2" style="display:none; font-size:.8rem;"></div>
       </div>
     </div>
@@ -107,6 +182,40 @@
         <small class="text-muted" id="last-sync-mode"></small>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- ── Live stats strip ── -->
+<div id="stats-strip" class="stats-strip mb-3" style="display:none;">
+  <div class="stat-item">
+    <i class="bi bi-clock text-muted"></i>
+    <span class="text-muted">Elapsed:</span>
+    <span class="stat-value blue" id="stat-elapsed">—</span>
+  </div>
+  <div class="stat-item">
+    <i class="bi bi-speedometer2 text-muted"></i>
+    <span class="text-muted">Rows/sec:</span>
+    <span class="stat-value blue" id="stat-rps">—</span>
+  </div>
+  <div class="stat-item">
+    <i class="bi bi-check-circle text-muted"></i>
+    <span class="text-muted">Synced:</span>
+    <span class="stat-value green" id="stat-synced">0</span>
+  </div>
+  <div class="stat-item">
+    <i class="bi bi-skip-forward text-muted"></i>
+    <span class="text-muted">Skipped:</span>
+    <span class="stat-value amber" id="stat-skipped">0</span>
+  </div>
+  <div class="stat-item">
+    <i class="bi bi-exclamation-triangle text-muted"></i>
+    <span class="text-muted">Errors:</span>
+    <span class="stat-value red" id="stat-errors">0</span>
+  </div>
+  <div class="stat-item ms-auto">
+    <i class="bi bi-layers text-muted"></i>
+    <span class="text-muted">Mode:</span>
+    <span class="stat-value" id="stat-mode">—</span>
   </div>
 </div>
 
@@ -124,16 +233,19 @@
       <table class="table table-sm align-middle mb-0" id="progress-table">
         <thead class="table-light">
           <tr>
-            <th style="width:160px;">Table</th>
+            <th style="width:140px;">Table</th>
             <th style="width:110px;">Status</th>
             <th>Progress</th>
-            <th style="width:100px;" class="text-end">Rows</th>
-            <th style="width:160px;">Started</th>
-            <th style="width:160px;">Finished</th>
+            <th style="width:80px;" class="text-end">Synced</th>
+            <th style="width:80px;" class="text-end text-warning" title="Rows skipped due to normalization or upsert errors">Bad Rows</th>
+            <th style="width:60px;" class="text-end text-danger">Err</th>
+            <th style="width:60px;" class="text-end text-muted">Batches</th>
+            <th style="width:130px;">Started</th>
+            <th style="width:130px;">Finished</th>
           </tr>
         </thead>
         <tbody id="progress-tbody">
-          <tr><td colspan="6" class="text-muted text-center py-3">
+          <tr><td colspan="9" class="text-muted text-center py-3">
             No sync data yet. Run a sync to see live progress.
           </td></tr>
         </tbody>
@@ -142,14 +254,62 @@
   </div>
 </div>
 
-<!-- ── Live console ── -->
+<!-- ── Live debug log panel ── -->
 <div class="card shadow-sm border-0 mb-4">
   <div class="card-body">
-    <h6 class="fw-bold mb-2">
-      <i class="bi bi-terminal text-dark me-2"></i>Live Log
-    </h6>
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h6 class="fw-bold mb-0">
+        <i class="bi bi-terminal text-dark me-2"></i>Live Debug Log
+        <small class="text-muted fw-normal ms-2" id="log-count-badge"></small>
+      </h6>
+      <div class="d-flex gap-2">
+        <label class="form-check-label small text-muted me-1" for="chkAutoScroll">Auto-scroll</label>
+        <input class="form-check-input" type="checkbox" id="chkAutoScroll" checked>
+        <button class="btn btn-sm btn-outline-secondary" onclick="clearLogConsole()">
+          <i class="bi bi-trash me-1"></i>Clear
+        </button>
+      </div>
+    </div>
     <div id="live-console">
-      <span class="log-info">Waiting for sync activity…</span>
+      <span class="log-INFO">Waiting for sync activity…</span>
+    </div>
+    <div class="d-flex gap-3 mt-2" style="font-size:.72rem;">
+      <span><span style="color:#64748b;">■</span> DEBUG</span>
+      <span><span style="color:#94a3b8;">■</span> INFO</span>
+      <span><span style="color:#fbbf24;">■</span> WARNING</span>
+      <span><span style="color:#f87171;">■</span> ERROR</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── Recent Sync Errors ── -->
+<div class="card shadow-sm border-0 mb-4" id="error-panel" style="display:none;">
+  <div class="card-body">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <h6 class="fw-bold mb-0 text-danger">
+        <i class="bi bi-bug me-2"></i>Recent Sync Errors
+        <small class="fw-normal ms-1" id="error-count-badge"></small>
+      </h6>
+      <button class="btn btn-sm btn-outline-secondary" onclick="loadErrors()">
+        <i class="bi bi-arrow-clockwise me-1"></i>Refresh
+      </button>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm mb-0" id="error-log-table">
+        <thead class="table-light">
+          <tr>
+            <th style="width:50px;">#</th>
+            <th style="width:120px;">Table</th>
+            <th style="width:90px;">Row ID</th>
+            <th>Error</th>
+            <th style="width:130px;">Time</th>
+            <th style="width:80px;"></th>
+          </tr>
+        </thead>
+        <tbody id="error-tbody">
+          <tr><td colspan="6" class="text-muted text-center py-3">No errors.</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </div>
@@ -190,78 +350,161 @@
 
 {% block extra_scripts %}
 <script>
-// ═══════════════════════════════════════════════════════════════
-// SYNC PAGE — Live polling + history
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// SYNC PAGE — Multi-DB live polling + debug log + error viewer
+// ═══════════════════════════════════════════════════════════════════════════════
 
 const TABLE_ORDER = [
-  "brands","categories","product_group",
-  "products","transactions","transaction_sell_lines"
+  "brands", "categories", "product_group", "products", "product_metrics"
 ];
 
-let pollTimer   = null;
-let isPolling   = false;
-let lastLogLines = [];
+let pollTimer     = null;
+let logPollTimer  = null;
+let isPolling     = false;
+let _selectedDbId = null;
+let _databases    = [];
 
-// ── Helpers ────────────────────────────────────────────────────
+// Incremental log fetching: track the newest timestamp we've received
+let _lastLogTs    = null;
+// Buffer of all log lines shown (never cleared unless user clicks Clear)
+let _logLines     = [];
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+function escHtml(s) {
+  if (s == null) return "";
+  return String(s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
 function fmtTime(iso) {
   if (!iso) return "—";
-  const d = new Date(iso);
-  return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"});
+  return new Date(iso).toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit"
+  });
 }
 
 function fmtRows(n) {
-  return n ? n.toLocaleString() : "0";
+  if (n == null) return "0";
+  return Number(n).toLocaleString();
 }
 
 function statusBadge(status) {
   const map = {
-    pending: ["status-pending", "bi-circle",        "Pending"],
-    running: ["status-running", "bi-arrow-repeat",  "Running"],
-    ok:      ["status-ok",      "bi-check-circle",  "OK"],
-    error:   ["status-error",   "bi-x-circle",      "Error"],
+    pending:  ["status-pending",  "bi-circle",         "Pending"],
+    running:  ["status-running",  "bi-arrow-repeat",   "Running"],
+    ok:       ["status-ok",       "bi-check-circle",   "OK"],
+    stopped:  ["status-stopped",  "bi-pause-circle",   "Stopped"],
+    error:    ["status-error",    "bi-x-circle",       "Error"],
+    failed:   ["status-error",    "bi-x-circle",       "Failed"],
+    completed:["status-ok",       "bi-check-circle",   "Done"],
+    skipped:  ["status-skipped",  "bi-skip-forward",   "Skipped"],
   };
   const [cls, icon, label] = map[status] || ["status-pending","bi-circle","—"];
-  return `<span class="status-badge ${cls}"><i class="bi ${icon}"></i>${label}</span>`;
+  return `<span class="status-badge ${cls}"><i class="bi ${icon}"></i> ${label}</span>`;
 }
 
-function progressFill(status, rows) {
-  const cls = status === "ok" ? "done" : status === "error" ? "errored" : "";
-  const pct = status === "ok" ? 100 : status === "running" ? 60 : status === "error" ? 100 : 0;
+function progressFill(status) {
+  const cls      = status === "ok" || status === "completed" ? "done"
+                 : status === "error" || status === "failed"  ? "errored"
+                 : status === "stopped" ? "stopped"
+                 : status === "skipped"  ? "skipped" : "";
+  const pct      = (status === "ok" || status === "completed") ? 100
+                 : status === "running" ? 60
+                 : (status === "error" || status === "failed") ? 100
+                 : status === "stopped" ? 50
+                 : status === "skipped"  ? 100 : 0;
   const animated = status === "running" ? "progress-bar-animated progress-bar-striped" : "";
-  return `
-    <div class="sync-progress">
-      <div class="sync-progress-fill ${cls} ${animated}" style="width:${pct}%"></div>
-    </div>
-    ${status === "running" ? `<small class="text-muted">${fmtRows(rows)} rows…</small>` : ""}
-  `;
+  return `<div class="sync-progress">
+    <div class="sync-progress-fill ${cls} ${animated}" style="width:${pct}%"></div>
+  </div>`;
 }
 
-// ── Render progress table ──────────────────────────────────────
+// ── Database selector ──────────────────────────────────────────────────────────
+async function loadDbSelector() {
+  try {
+    const resp = await fetch("/api/databases");
+    _databases = await resp.json();
+    const sel  = document.getElementById("db-selector");
+
+    if (!_databases.length) {
+      sel.innerHTML = `<option value="">No databases configured</option>`;
+      return;
+    }
+
+    sel.innerHTML = _databases.map(db =>
+      `<option value="${db.id}">${escHtml(db.name)} — ${escHtml(db.host)}/${escHtml(db.database_name)}</option>`
+    ).join("");
+
+    _selectedDbId = _databases[0].id;
+    updateDbStatusPill(_databases[0]);
+  } catch { /* ignore */ }
+}
+
+function onDbChange() {
+  const sel = document.getElementById("db-selector");
+  _selectedDbId = parseInt(sel.value) || null;
+  const db = _databases.find(d => d.id === _selectedDbId);
+  if (db) updateDbStatusPill(db);
+  // Reset incremental log cursor when switching databases
+  _lastLogTs = null;
+  _logLines  = [];
+  document.getElementById("live-console").innerHTML =
+    `<span class="log-INFO">Switched to database ${_selectedDbId}…</span>`;
+}
+
+function updateDbStatusPill(db) {
+  const pill = document.getElementById("db-status-pill");
+  const map  = { never:"🔘", running:"🔵", ok:"🟢", error:"🔴", stopped:"🟡" };
+  const icon = map[db.sync_status] || "🔘";
+  const last = db.last_sync_at
+    ? `Last: ${new Date(db.last_sync_at).toLocaleString([],
+        {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}`
+    : "Never synced";
+  pill.textContent = `${icon} ${last}`;
+}
+
+// ── Progress table ─────────────────────────────────────────────────────────────
 function renderProgress(state) {
   const tbody = document.getElementById("progress-tbody");
-  if (!state || !state.tables || Object.keys(state.tables).length === 0) {
-    tbody.innerHTML = `<tr><td colspan="6" class="text-muted text-center py-3">
-      No sync data yet. Run a sync to see live progress.</td></tr>`;
+  if (!state || !state.tables || !Object.keys(state.tables).length) {
+    tbody.innerHTML = `<tr><td colspan="9" class="text-muted text-center py-3">
+      No sync data yet. Select a database and run a sync.</td></tr>`;
     return;
   }
 
   const rows = TABLE_ORDER.map(t => {
-    const info = state.tables[t] || {status:"pending",rows:0,error:null};
-    const rowCls = info.status === "running" ? "row-running"
-                 : info.status === "ok"      ? "row-ok"
-                 : info.status === "error"   ? "row-error" : "";
+    const info   = state.tables[t] || {
+      status: "pending", rows_synced: 0, rows_skipped: 0,
+      rows_error: 0, batch_count: 0, error: null
+    };
+    const st     = info.status || "pending";
+    const rowCls = st === "running"  ? "row-running"
+                 : st === "ok" || st === "completed" ? "row-ok"
+                 : st === "error" || st === "failed"  ? "row-error"
+                 : st === "stopped" ? "row-stopped"
+                 : st === "skipped"  ? "row-skipped" : "";
+
+    // Support both old format (rows) and new format (rows_synced)
+    const synced  = info.rows_synced  != null ? info.rows_synced  : (info.rows || 0);
+    const skipped = info.rows_skipped != null ? info.rows_skipped : 0;
+    const errors  = info.rows_error   != null ? info.rows_error   : 0;
+    const batches = info.batch_count  != null ? info.batch_count  : 0;
+
     return `
       <tr class="sync-row ${rowCls}">
         <td><code>${t}</code></td>
-        <td>${statusBadge(info.status)}</td>
-        <td>${progressFill(info.status, info.rows)}</td>
-        <td class="text-end fw-semibold">${fmtRows(info.rows)}</td>
+        <td>${statusBadge(st)}</td>
+        <td>${progressFill(st)}</td>
+        <td class="text-end fw-semibold">${fmtRows(synced)}</td>
+        <td class="text-end text-warning">${skipped > 0 ? fmtRows(skipped) : '<span class="text-muted">0</span>'}</td>
+        <td class="text-end text-danger">${errors > 0 ? `<strong>${fmtRows(errors)}</strong>` : '<span class="text-muted">0</span>'}</td>
+        <td class="text-end text-muted">${fmtRows(batches)}</td>
         <td><small class="text-muted">${fmtTime(info.started_at)}</small></td>
         <td><small class="text-muted">${fmtTime(info.finished_at)}</small></td>
       </tr>
-      ${info.error ? `<tr class="${rowCls}"><td colspan="6">
-        <small class="text-danger"><i class="bi bi-exclamation-triangle me-1"></i>${info.error}</small>
+      ${info.error ? `<tr class="${rowCls}"><td colspan="9">
+        <small class="text-danger"><i class="bi bi-exclamation-triangle me-1"></i>${escHtml(info.error)}</small>
       </td></tr>` : ""}
     `;
   }).join("");
@@ -269,29 +512,76 @@ function renderProgress(state) {
   tbody.innerHTML = rows;
 }
 
-// ── Update global status badge ─────────────────────────────────
+// ── Stats strip ────────────────────────────────────────────────────────────────
+function updateStats(state) {
+  const strip = document.getElementById("stats-strip");
+  if (!state || (!state.running && !state.finished_at)) {
+    strip.style.display = "none";
+    return;
+  }
+  strip.style.display = "flex";
+
+  const totalSynced  = state.rows_synced  || 0;
+  const totalSkipped = state.rows_skipped || 0;
+  const totalErrors  = state.rows_error   || 0;
+
+  document.getElementById("stat-synced").textContent  = fmtRows(totalSynced);
+  document.getElementById("stat-skipped").textContent = fmtRows(totalSkipped);
+  document.getElementById("stat-errors").textContent  = fmtRows(totalErrors);
+  document.getElementById("stat-mode").textContent    = state.mode || "—";
+
+  // Elapsed
+  if (state.started_at) {
+    const endTs  = state.finished_at ? new Date(state.finished_at) : new Date();
+    const startTs = new Date(state.started_at);
+    const secs    = Math.max(0, Math.round((endTs - startTs) / 1000));
+    const mm = String(Math.floor(secs / 60)).padStart(2,"0");
+    const ss = String(secs % 60).padStart(2,"0");
+    document.getElementById("stat-elapsed").textContent = `${mm}:${ss}`;
+
+    const rps = secs > 0 ? (totalSynced / secs).toFixed(1) : "—";
+    document.getElementById("stat-rps").textContent = rps;
+  }
+}
+
+// ── Global status badge ────────────────────────────────────────────────────────
 function updateGlobalBadge(state) {
   const el = document.getElementById("global-status-badge");
   if (!state) return;
 
   if (state.running) {
     el.className = "status-badge status-running";
-    el.innerHTML = `<span class="spinner-border spinner-border-sm" style="width:.7rem;height:.7rem;"></span> Running`;
-  } else if (state.finished_at) {
-    const hasError = state.tables && Object.values(state.tables).some(t => t.status === "error");
-    if (hasError) {
-      el.className = "status-badge status-error";
-      el.innerHTML = `<i class="bi bi-x-circle-fill" style="font-size:.75rem;"></i> Completed with errors`;
-    } else {
-      el.className = "status-badge status-ok";
-      el.innerHTML = `<i class="bi bi-check-circle-fill" style="font-size:.75rem;"></i> Completed`;
-    }
+    el.innerHTML = `<span class="spinner-border spinner-border-sm"
+      style="width:.7rem;height:.7rem;"></span> Running`;
+    document.getElementById("btnStop").classList.remove("disabled");
+    document.getElementById("btnFullSync").classList.add("disabled");
+    document.getElementById("btnIncrSync").classList.add("disabled");
   } else {
-    el.className = "status-badge status-pending";
-    el.innerHTML = `<i class="bi bi-circle-fill" style="font-size:.5rem;"></i> Idle`;
+    document.getElementById("btnStop").classList.add("disabled");
+    document.getElementById("btnFullSync").classList.remove("disabled");
+    document.getElementById("btnIncrSync").classList.remove("disabled");
+
+    if (state.finished_at) {
+      const hasError   = state.tables &&
+        Object.values(state.tables).some(t => t.status === "error" || t.status === "failed");
+      const hasStopped = state.tables &&
+        Object.values(state.tables).some(t => t.status === "stopped");
+      if (hasError) {
+        el.className = "status-badge status-error";
+        el.innerHTML = `<i class="bi bi-x-circle-fill" style="font-size:.75rem;"></i> Completed with errors`;
+      } else if (hasStopped) {
+        el.className = "status-badge status-stopped";
+        el.innerHTML = `<i class="bi bi-pause-circle-fill" style="font-size:.75rem;"></i> Stopped`;
+      } else {
+        el.className = "status-badge status-ok";
+        el.innerHTML = `<i class="bi bi-check-circle-fill" style="font-size:.75rem;"></i> Completed`;
+      }
+    } else {
+      el.className = "status-badge status-pending";
+      el.innerHTML = `<i class="bi bi-circle-fill" style="font-size:.5rem;"></i> Idle`;
+    }
   }
 
-  // Last sync info card
   if (state.finished_at || state.started_at) {
     document.getElementById("last-sync-time").textContent =
       fmtTime(state.finished_at || state.started_at);
@@ -300,71 +590,169 @@ function updateGlobalBadge(state) {
   }
 }
 
-// ── Live console log ───────────────────────────────────────────
-function updateConsole(state) {
-  if (!state || !state.tables) return;
-  const console_ = document.getElementById("live-console");
-  const lines = [];
+// ── Live log console (incremental, polls /api/database/<id>/logs) ──────────────
+const LEVEL_ORDER = ["DEBUG","INFO","WARNING","ERROR"];
 
-  if (state.started_at) {
-    lines.push(`<span class="log-info">[${fmtTime(state.started_at)}] Sync started (${state.mode || "full"})</span>`);
+function appendLogEntries(entries) {
+  if (!entries || !entries.length) return;
+
+  const console_ = document.getElementById("live-console");
+  const autoScroll = document.getElementById("chkAutoScroll").checked;
+
+  // Clear placeholder on first real entry
+  if (_logLines.length === 0 &&
+      console_.querySelector(".log-INFO")?.textContent?.startsWith("Waiting")) {
+    console_.innerHTML = "";
   }
 
-  TABLE_ORDER.forEach(t => {
-    const info = state.tables[t];
-    if (!info || info.status === "pending") return;
-    if (info.status === "running") {
-      lines.push(`<span class="log-running">[${fmtTime(info.started_at)}] → ${t}: syncing… ${fmtRows(info.rows)} rows</span>`);
-    } else if (info.status === "ok") {
-      lines.push(`<span class="log-ok">[${fmtTime(info.finished_at)}] ✓ ${t}: ${fmtRows(info.rows)} rows synced</span>`);
-    } else if (info.status === "error") {
-      lines.push(`<span class="log-error">[${fmtTime(info.finished_at)}] ✗ ${t}: ERROR — ${info.error}</span>`);
-    }
+  entries.forEach(e => {
+    const level = (e.level || "INFO").toUpperCase();
+    const ts    = e.ts ? new Date(e.ts).toLocaleTimeString([],
+                    {hour:"2-digit",minute:"2-digit",second:"2-digit"}) : "";
+    const line  = `<span class="log-${level}">[${ts}] [${level}] ${escHtml(e.message)}</span>`;
+    _logLines.push(line);
+    if (_logLines.length > 2000) _logLines.shift();
   });
 
-  if (state.finished_at) {
-    lines.push(`<span class="log-info">[${fmtTime(state.finished_at)}] Sync finished.</span>`);
-  }
+  // Update timestamp for next incremental fetch
+  _lastLogTs = entries[entries.length - 1].ts;
 
-  if (lines.length === 0) {
-    lines.push(`<span class="log-info">Waiting for sync activity…</span>`);
-  }
+  // Rebuild display (cap at last 500 lines for performance)
+  const display = _logLines.slice(-500);
+  console_.innerHTML = display.join("<br>");
 
-  // Only update DOM if content changed
-  const joined = lines.join("\n");
-  if (joined !== lastLogLines) {
-    lastLogLines = joined;
-    console_.innerHTML = lines.join("<br>");
+  if (autoScroll) {
     console_.scrollTop = console_.scrollHeight;
+  }
+
+  document.getElementById("log-count-badge").textContent =
+    `(${_logLines.length} lines)`;
+}
+
+async function pollLogs() {
+  if (!_selectedDbId) return;
+  try {
+    const url  = _lastLogTs
+      ? `/api/database/${_selectedDbId}/logs?since=${encodeURIComponent(_lastLogTs)}`
+      : `/api/database/${_selectedDbId}/logs`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (data.logs && data.logs.length) {
+      appendLogEntries(data.logs);
+    }
+  } catch { /* ignore */ }
+}
+
+function clearLogConsole() {
+  _logLines  = [];
+  _lastLogTs = null;
+  document.getElementById("live-console").innerHTML =
+    `<span class="log-INFO">Log cleared.</span>`;
+  document.getElementById("log-count-badge").textContent = "";
+}
+
+// ── Error viewer ───────────────────────────────────────────────────────────────
+async function loadErrors() {
+  if (!_selectedDbId) return;
+  const panel = document.getElementById("error-panel");
+  const tbody = document.getElementById("error-tbody");
+  try {
+    const resp = await fetch(`/api/database/${_selectedDbId}/errors?limit=50`);
+    const data = await resp.json();
+    const errors = data.errors || [];
+
+    document.getElementById("error-count-badge").textContent =
+      errors.length ? `(${errors.length} recent)` : "(none)";
+    panel.style.display = errors.length ? "block" : "none";
+
+    if (!errors.length) {
+      tbody.innerHTML = `<tr><td colspan="6" class="text-muted text-center py-3">No errors.</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = errors.map((e, i) => {
+      const payloadId = `payload-${i}`;
+      return `
+        <tr>
+          <td class="text-muted">${e.id}</td>
+          <td><code>${escHtml(e.table_name)}</code></td>
+          <td class="text-muted">${e.source_row_id ?? "—"}</td>
+          <td class="text-danger small">${escHtml(e.error_message)}</td>
+          <td><small class="text-muted">${e.created_at ? e.created_at.slice(0,19).replace("T"," ") : "—"}</small></td>
+          <td>
+            ${e.raw_payload || e.traceback ? `
+              <button class="btn btn-xs btn-outline-secondary btn-sm py-0 px-1"
+                      style="font-size:.7rem;"
+                      onclick="togglePayload('${payloadId}')">
+                Detail
+              </button>
+              <div id="${payloadId}" style="display:none;" class="mt-1">
+                ${e.raw_payload ? `<div class="err-payload">${escHtml(e.raw_payload)}</div>` : ""}
+                ${e.traceback   ? `<div class="err-payload mt-1">${escHtml(e.traceback)}</div>`  : ""}
+              </div>
+            ` : ""}
+          </td>
+        </tr>
+      `;
+    }).join("");
+  } catch {
+    tbody.innerHTML = `<tr><td colspan="6" class="text-danger">Failed to load errors.</td></tr>`;
   }
 }
 
-// ── Poll /api/sync/live ────────────────────────────────────────
+function togglePayload(id) {
+  const el = document.getElementById(id);
+  if (el) el.style.display = el.style.display === "none" ? "block" : "none";
+}
+
+// ── Poll live state ────────────────────────────────────────────────────────────
 async function pollLive() {
   try {
-    const resp  = await fetch("/api/sync/live");
-    const state = await resp.json();
+    const url   = _selectedDbId
+      ? `/api/database/${_selectedDbId}/status`
+      : "/api/sync/live";
+    const resp  = await fetch(url);
+    const data  = await resp.json();
+    const state = data.live || data;
 
     renderProgress(state);
     updateGlobalBadge(state);
-    updateConsole(state);
+    updateStats(state);
 
     document.getElementById("poll-indicator").textContent =
       `Updated ${new Date().toLocaleTimeString()}`;
 
-    // If sync just finished, reload history and stop fast polling
+    // Detect stale DB job state: DB says running, but in-memory live state is not running.
+    if (!state.running && data.last_job && data.last_job.status === "running") {
+      document.getElementById("poll-indicator").textContent =
+        "Sync job is stale in DB (running flag without live worker).";
+      if (!_logLines.some(line => line.includes("stale in DB"))) {
+        appendLogEntries([{
+          ts: new Date().toISOString(),
+          level: "WARNING",
+          msg: "Detected stale running job in DB. Restart app or stop/reset stale job, then start sync again.",
+        }]);
+      }
+    }
+
     if (!state.running && isPolling) {
       isPolling = false;
       clearInterval(pollTimer);
-      pollTimer = setInterval(pollLive, 10000); // slow poll when idle
+      clearInterval(logPollTimer);
+      pollTimer    = setInterval(pollLive,  10000);
+      logPollTimer = setInterval(pollLogs,  10000);
+      // Final log + error fetch after sync ends
+      await pollLogs();
+      loadErrors();
       loadHistory();
+      loadDbSelector();
     }
-  } catch (e) {
+  } catch {
     document.getElementById("poll-indicator").textContent = "Poll error";
   }
 }
 
-// ── Load history table ─────────────────────────────────────────
+// ── History table ──────────────────────────────────────────────────────────────
 async function loadHistory() {
   const tbody = document.getElementById("history-tbody");
   try {
@@ -379,7 +767,7 @@ async function loadHistory() {
     tbody.innerHTML = rows.map(r => `
       <tr>
         <td><small class="text-muted">${r.id}</small></td>
-        <td><code>${r.table_name}</code></td>
+        <td><code>${escHtml(r.table_name)}</code></td>
         <td><small>${r.last_synced ? r.last_synced.replace("T"," ").slice(0,19) : "—"}</small></td>
         <td class="text-end">${fmtRows(r.records_synced)}</td>
         <td>
@@ -387,84 +775,115 @@ async function loadHistory() {
             ? `<span class="history-ok"><i class="bi bi-check-circle me-1"></i>OK</span>`
             : `<span class="history-error"><i class="bi bi-x-circle me-1"></i>Error</span>`}
         </td>
-        <td><small class="text-danger">${r.error_msg || ""}</small></td>
+        <td><small class="text-danger">${escHtml(r.error_msg) || ""}</small></td>
       </tr>
     `).join("");
-  } catch (e) {
+  } catch {
     tbody.innerHTML = `<tr><td colspan="6" class="text-danger">Failed to load history.</td></tr>`;
   }
 }
 
-// ── Button handlers ────────────────────────────────────────────
-document.getElementById("btnFullSync").addEventListener("click", async function () {
-  const btn = this;
-  btn.disabled  = true;
-  btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span>Starting…`;
+// ── Sync button handlers ───────────────────────────────────────────────────────
+async function triggerSync(full) {
+  if (!_selectedDbId) { alert("Select a database first."); return; }
+  const btnId    = full ? "btnFullSync" : "btnIncrSync";
+  const btn      = document.getElementById(btnId);
+  const origHTML = btn.innerHTML;
+  btn.disabled   = true;
+  btn.innerHTML  = `<span class="spinner-border spinner-border-sm me-1"></span>Starting…`;
+
+  // Reset log state for fresh sync
+  _lastLogTs = null;
+  _logLines  = [];
+  document.getElementById("live-console").innerHTML =
+    `<span class="log-INFO">Starting ${full ? "full" : "incremental"} sync…</span>`;
 
   try {
-    const resp = await fetch("/api/sync", {
+    const resp = await fetch(`/api/database/${_selectedDbId}/sync`, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ full: true }),
+      body:    JSON.stringify({ full }),
     });
     const data = await resp.json();
 
-    if (data.status === "already_running") {
-      alert("A sync is already running. Please wait.");
+    if (!resp.ok) {
+      const msg = data.message || data.error || `HTTP ${resp.status}`;
+      appendLogEntries([{
+        ts: new Date().toISOString(),
+        level: "ERROR",
+        msg: `Failed to start sync: ${msg}`,
+      }]);
+      if (resp.status === 409 || data.status === "already_running") {
+        alert("A sync is already running (or stale). Please stop/reset it first.");
+      } else {
+        alert(`Failed to start sync: ${msg}`);
+      }
       return;
     }
 
-    // Start fast polling
     isPolling = true;
     clearInterval(pollTimer);
-    pollTimer = setInterval(pollLive, 2000);
-    pollLive(); // immediate first poll
-
+    clearInterval(logPollTimer);
+    pollTimer    = setInterval(pollLive, 2500);
+    logPollTimer = setInterval(pollLogs, 2500);
+    pollLive();
+    pollLogs();
   } catch (e) {
     alert("Failed to start sync: " + e.message);
   } finally {
     btn.disabled  = false;
-    btn.innerHTML = `<i class="bi bi-play-fill me-1"></i>Run Full Sync`;
+    btn.innerHTML = origHTML;
+  }
+}
+
+document.getElementById("btnFullSync").addEventListener("click", () => triggerSync(true));
+document.getElementById("btnIncrSync").addEventListener("click", () => triggerSync(false));
+
+document.getElementById("btnStop").addEventListener("click", async function () {
+  if (!_selectedDbId) return;
+  this.disabled  = true;
+  this.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span>Stopping…`;
+  try {
+    const resp = await fetch(`/api/database/${_selectedDbId}/stop`, { method: "POST" });
+    const data = await resp.json();
+    if (!data.ok) alert(data.message);
+  } catch (e) {
+    alert("Stop failed: " + e.message);
+  } finally {
+    this.innerHTML = `<i class="bi bi-stop-fill me-1"></i>Stop Sync`;
   }
 });
 
+// ── Rebuild index ──────────────────────────────────────────────────────────────
 document.getElementById("btnRebuild").addEventListener("click", async function () {
   const btn        = this;
   const resultEl   = document.getElementById("rebuild-result");
   const statusText = document.getElementById("index-status-text");
   const strip      = document.getElementById("index-status-strip");
-
-  // Capture the current count before we wipe it
-  const prevCount = parseInt(
-    statusText.textContent.match(/[\d,]+/)?.[0]?.replace(/,/g, "") || "0"
+  const prevCount  = parseInt(
+    statusText.textContent.match(/[\d,]+/)?.[0]?.replace(/,/g,"") || "0"
   );
 
   btn.disabled  = true;
   btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span>Rebuilding…`;
   resultEl.style.display = "none";
-
-  // Show "clearing" state on the strip
   strip.style.background = "#fef9c3";
   statusText.innerHTML   = `<span class="text-warning">
-    <i class="bi bi-hourglass-split me-1"></i>Clearing old index (${prevCount.toLocaleString()} products)…
-  </span>`;
+    <i class="bi bi-hourglass-split me-1"></i>Clearing old index (${prevCount.toLocaleString()} products)…</span>`;
 
   try {
     const resp = await fetch("/api/search/rebuild", { method: "POST" });
     const data = await resp.json();
     const newCount = data.indexed || 0;
-
-    // Success state
     strip.style.background = "#f0fdf4";
     statusText.innerHTML   = `<span class="text-success fw-semibold">
-      <i class="bi bi-check-circle-fill me-1"></i>${newCount.toLocaleString()} products indexed
-    </span>`;
-
+      <i class="bi bi-check-circle-fill me-1"></i>${newCount.toLocaleString()} products indexed</span>`;
     resultEl.innerHTML = `
-      <div class="d-flex align-items-center gap-2 p-2 rounded" style="background:#f0fdf4; border:1px solid #86efac;">
+      <div class="d-flex align-items-center gap-2 p-2 rounded"
+           style="background:#f0fdf4; border:1px solid #86efac;">
         <i class="bi bi-check-circle-fill text-success"></i>
         <div>
-          <span class="fw-semibold text-success">Index rebuilt successfully</span><br>
+          <span class="fw-semibold text-success">Index rebuilt</span><br>
           <span class="text-muted">
             ${prevCount.toLocaleString()} → <strong>${newCount.toLocaleString()}</strong> products
             &nbsp;·&nbsp; cache cleared (${data.cache_cleared || 0} entries)
@@ -472,14 +891,11 @@ document.getElementById("btnRebuild").addEventListener("click", async function (
         </div>
       </div>`;
     resultEl.style.display = "block";
-
-    // Auto-hide result after 8 seconds
     setTimeout(() => { resultEl.style.display = "none"; }, 8000);
-
   } catch (e) {
     strip.style.background = "#fef2f2";
     statusText.innerHTML   = `<span class="text-danger"><i class="bi bi-x-circle me-1"></i>Rebuild failed</span>`;
-    resultEl.innerHTML     = `<span class="text-danger"><i class="bi bi-x-circle me-1"></i>${e.message}</span>`;
+    resultEl.innerHTML     = `<span class="text-danger">${e.message}</span>`;
     resultEl.style.display = "block";
   } finally {
     btn.disabled  = false;
@@ -487,35 +903,38 @@ document.getElementById("btnRebuild").addEventListener("click", async function (
   }
 });
 
-// ── Load current index stats into the strip on page load ──────
+// ── Index stats ────────────────────────────────────────────────────────────────
 async function loadIndexStats() {
   const statusText = document.getElementById("index-status-text");
   const strip      = document.getElementById("index-status-strip");
   try {
-    const resp = await fetch("/api/stats");
-    const data = await resp.json();
-    const count    = data.total_products || 0;
-    const lastBuilt = data.last_built
-      ? new Date(data.last_built * 1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"})
+    const resp  = await fetch("/api/stats");
+    const data  = await resp.json();
+    const count = data.total_products || 0;
+    const last  = data.last_built
+      ? new Date(data.last_built * 1000).toLocaleTimeString([],
+          {hour:"2-digit",minute:"2-digit",second:"2-digit"})
       : "—";
     strip.style.background = "#eff6ff";
     statusText.innerHTML   = `
       <i class="bi bi-check-circle text-primary me-1"></i>
-      <strong>${count.toLocaleString()}</strong> products currently indexed
-      &nbsp;·&nbsp; last built at ${lastBuilt}
-    `;
+      <strong>${count.toLocaleString()}</strong> products indexed
+      &nbsp;·&nbsp; last built at ${last}`;
   } catch {
     statusText.textContent = "Could not load index stats.";
   }
 }
 
-// ── Init ───────────────────────────────────────────────────────
-document.addEventListener("DOMContentLoaded", () => {
-  loadIndexStats();   // populate the index status strip immediately
+// ── Init ───────────────────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", async () => {
+  await loadDbSelector();
+  loadIndexStats();
   pollLive();
+  pollLogs();
   loadHistory();
-  // Slow background poll when idle
-  pollTimer = setInterval(pollLive, 10000);
+  loadErrors();
+  pollTimer    = setInterval(pollLive, 10000);
+  logPollTimer = setInterval(pollLogs, 10000);
 });
 </script>
 {% endblock %}

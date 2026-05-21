@@ -16,7 +16,7 @@
   <!-- ── Image column ── -->
   <div class="col-md-4">
     <div class="card shadow-sm border-0">
-      {% set img = (product.main_image or product.image) | img_url %}
+      {% set img = (product.main_image or product.image) | img_url(product.source_db_id) %}
       {% if img %}
       <img
         src="{{ img }}"
@@ -135,7 +135,7 @@
     <a href="javascript:history.back()" class="btn btn-outline-secondary">
       <i class="bi bi-arrow-left me-1"></i>Back
     </a>
-    {% set img = (product.main_image or product.image) | img_url %}
+    {% set img = (product.main_image or product.image) | img_url(product.source_db_id) %}
     <button
       class="btn btn-outline-primary ms-2"
       id="detail-cart-btn"
