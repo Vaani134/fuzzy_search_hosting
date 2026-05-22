@@ -331,7 +331,7 @@
 <div class="row row-cols-1 row-cols-sm-2 row-cols-md-3 row-cols-xl-4 g-4">
   {% for p in results %}
   <div class="col">
-    {% set img = (p.main_image or p.image) | img_url(p.source_db_id) %}
+    {% set img = (p.main_image or p.image) | img_url %}
     <div class="card product-card h-100 shadow-sm position-relative"
          id="card-{{ p.id }}">
 

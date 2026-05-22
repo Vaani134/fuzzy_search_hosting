@@ -69,7 +69,7 @@ from datetime import datetime, timezone
 from flask import Flask, render_template, request, jsonify, abort, send_file
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import SECRET_KEY, DEBUG, HOST, PORT, SEARCH_DEFAULT_K, SYNC_TABLES
+from config import SECRET_KEY, DEBUG, HOST, PORT, SEARCH_DEFAULT_K, SYNC_TABLES, AUTO_CLEANUP, CACHE_DIR
 from db.database import init_db, get_connection, dict_from_row, seed_primary_database_from_settings
 from modules.fuzzy_search import get_engine, get_global_engine, apply_synonyms
 from modules.sync import sync_all_background, sync_table, get_sync_status, get_sync_history, get_live_state
@@ -229,6 +229,14 @@ def _cleanup_stale_running_sync_jobs() -> None:
 
 _cleanup_stale_running_sync_jobs()
 
+# Remove orphaned .tmp files left by interrupted cache writes.
+if AUTO_CLEANUP:
+    try:
+        from modules.cache_manager import cleanup_stale_tmp_files
+        cleanup_stale_tmp_files(CACHE_DIR)
+    except Exception as _e:
+        print(f"[startup] Cache cleanup warning: {_e}")
+
 # Reload synonyms from DB now that the table is guaranteed to exist.
 # The first call at module import time may have found an empty DB.
 from modules.fuzzy_search import reload_synonyms as _reload_synonyms
@@ -246,70 +254,144 @@ engine = get_engine(source_db_id=1, rebuild_interval=None)
 @app.route("/")
 def dashboard():
     """Dashboard — counts, top categories, recent sync status."""
+    databases = list_databases()
+    db_raw = (request.args.get("db_id", "1") or "1").strip().lower()
+    is_global_dashboard = db_raw == "all"
+    selected_db_id = None if is_global_dashboard else max(1, int(db_raw or 1))
+    if (not is_global_dashboard) and databases and not any(d["id"] == selected_db_id for d in databases):
+        selected_db_id = databases[0]["id"]
+
     conn = get_connection()
     try:
-        total_products     = conn.execute(
-            "SELECT COUNT(*) FROM products WHERE is_inactive=0"
-        ).fetchone()[0]
-        total_all_products = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-        total_categories   = conn.execute("SELECT COUNT(*) FROM categories WHERE deleted_at IS NULL").fetchone()[0]
-        total_brands       = conn.execute("SELECT COUNT(*) FROM brands WHERE deleted_at IS NULL").fetchone()[0]
-        total_groups       = conn.execute("SELECT COUNT(*) FROM product_group").fetchone()[0]
-        total_transactions = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-        out_of_stock       = conn.execute(
-            "SELECT COUNT(*) FROM products WHERE out_of_stock=1 AND is_inactive=0"
-        ).fetchone()[0]
-        not_for_selling    = conn.execute(
-            "SELECT COUNT(*) FROM products WHERE not_for_selling=1 AND is_inactive=0"
-        ).fetchone()[0]
-        inactive_products  = conn.execute(
-            "SELECT COUNT(*) FROM products WHERE is_inactive=1"
-        ).fetchone()[0]
+        if is_global_dashboard:
+            total_products     = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE is_inactive=0"
+            ).fetchone()[0]
+            total_all_products = conn.execute(
+                "SELECT COUNT(*) FROM products"
+            ).fetchone()[0]
+            total_categories   = conn.execute(
+                "SELECT COUNT(*) FROM categories WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+            total_brands       = conn.execute(
+                "SELECT COUNT(*) FROM brands WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+            total_groups       = conn.execute(
+                "SELECT COUNT(*) FROM product_group"
+            ).fetchone()[0]
+            total_transactions = conn.execute(
+                "SELECT COALESCE(SUM(sales_count),0) FROM product_metrics"
+            ).fetchone()[0]
+            out_of_stock       = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE out_of_stock=1 AND is_inactive=0"
+            ).fetchone()[0]
+            not_for_selling    = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE not_for_selling=1 AND is_inactive=0"
+            ).fetchone()[0]
+            inactive_products  = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE is_inactive=1"
+            ).fetchone()[0]
+        else:
+            total_products     = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE is_inactive=0 AND source_db_id=?",
+                (selected_db_id,),
+            ).fetchone()[0]
+            total_all_products = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE source_db_id=?",
+                (selected_db_id,),
+            ).fetchone()[0]
+            total_categories   = conn.execute(
+                "SELECT COUNT(*) FROM categories WHERE deleted_at IS NULL AND source_db_id=?",
+                (selected_db_id,),
+            ).fetchone()[0]
+            total_brands       = conn.execute(
+                "SELECT COUNT(*) FROM brands WHERE deleted_at IS NULL AND source_db_id=?",
+                (selected_db_id,),
+            ).fetchone()[0]
+            total_groups       = conn.execute(
+                "SELECT COUNT(*) FROM product_group WHERE source_db_id=?",
+                (selected_db_id,),
+            ).fetchone()[0]
+            total_transactions = conn.execute(
+                "SELECT COALESCE(SUM(sales_count),0) FROM product_metrics WHERE source_db_id=?",
+                (selected_db_id,),
+            ).fetchone()[0]
+            out_of_stock       = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE out_of_stock=1 AND is_inactive=0 AND source_db_id=?",
+                (selected_db_id,),
+            ).fetchone()[0]
+            not_for_selling    = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE not_for_selling=1 AND is_inactive=0 AND source_db_id=?",
+                (selected_db_id,),
+            ).fetchone()[0]
+            inactive_products  = conn.execute(
+                "SELECT COUNT(*) FROM products WHERE is_inactive=1 AND source_db_id=?",
+                (selected_db_id,),
+            ).fetchone()[0]
 
         # Top 10 categories by product count
-        top_categories = conn.execute(
-            """
-            SELECT c.name, COUNT(p.id) AS product_count
-            FROM categories c
-            LEFT JOIN products p ON p.category_id = c.id
-                AND p.is_inactive = 0 AND p.not_for_selling = 0
-            WHERE c.deleted_at IS NULL
-            GROUP BY c.id, c.name
-            ORDER BY product_count DESC
-            LIMIT 10
-            """
-        ).fetchall()
+        if is_global_dashboard:
+            top_categories = conn.execute(
+                """
+                SELECT c.name, COUNT(p.id) AS product_count
+                FROM categories c
+                LEFT JOIN products p ON p.category_id = c.id
+                    AND p.is_inactive = 0 AND p.not_for_selling = 0
+                WHERE c.deleted_at IS NULL
+                GROUP BY c.id, c.name
+                ORDER BY product_count DESC
+                LIMIT 10
+                """
+            ).fetchall()
+        else:
+            top_categories = conn.execute(
+                """
+                SELECT c.name, COUNT(p.id) AS product_count
+                FROM categories c
+                LEFT JOIN products p ON p.category_id = c.id
+                    AND p.is_inactive = 0 AND p.not_for_selling = 0 AND p.source_db_id = ?
+                WHERE c.deleted_at IS NULL AND c.source_db_id = ?
+                GROUP BY c.id, c.name
+                ORDER BY product_count DESC
+                LIMIT 10
+                """,
+                (selected_db_id, selected_db_id),
+            ).fetchall()
 
         # Top 10 brands by product count
-        top_brands = conn.execute(
-            """
-            SELECT b.name, COUNT(p.id) AS product_count
-            FROM brands b
-            LEFT JOIN products p ON p.brand_id = b.id
-                AND p.is_inactive = 0 AND p.not_for_selling = 0
-            WHERE b.deleted_at IS NULL
-            GROUP BY b.id, b.name
-            ORDER BY product_count DESC
-            LIMIT 10
-            """
-        ).fetchall()
-
-        # Recent transactions (last 5)
-        recent_transactions = conn.execute(
-            """
-            SELECT id, invoice_no, type, status, payment_status,
-                   final_total, transaction_date
-            FROM transactions
-            ORDER BY id DESC
-            LIMIT 5
-            """
-        ).fetchall()
+        if is_global_dashboard:
+            top_brands = conn.execute(
+                """
+                SELECT b.name, COUNT(p.id) AS product_count
+                FROM brands b
+                LEFT JOIN products p ON p.brand_id = b.id
+                    AND p.is_inactive = 0 AND p.not_for_selling = 0
+                WHERE b.deleted_at IS NULL
+                GROUP BY b.id, b.name
+                ORDER BY product_count DESC
+                LIMIT 10
+                """
+            ).fetchall()
+        else:
+            top_brands = conn.execute(
+                """
+                SELECT b.name, COUNT(p.id) AS product_count
+                FROM brands b
+                LEFT JOIN products p ON p.brand_id = b.id
+                    AND p.is_inactive = 0 AND p.not_for_selling = 0 AND p.source_db_id = ?
+                WHERE b.deleted_at IS NULL AND b.source_db_id = ?
+                GROUP BY b.id, b.name
+                ORDER BY product_count DESC
+                LIMIT 10
+                """,
+                (selected_db_id, selected_db_id),
+            ).fetchall()
 
     finally:
         conn.close()
 
     sync_status = get_sync_status()
-    eng_stats   = engine.stats()
+    eng_stats = get_global_engine().stats() if is_global_dashboard else get_engine(source_db_id=selected_db_id).stats()
 
     return render_template(
         "dashboard.html",
@@ -324,9 +406,11 @@ def dashboard():
         inactive_products=inactive_products,
         top_categories=[dict(r) for r in top_categories],
         top_brands=[dict(r) for r in top_brands],
-        recent_transactions=[dict(r) for r in recent_transactions],
         sync_status=sync_status,
         eng_stats=eng_stats,
+        databases=databases,
+        selected_db_id=("all" if is_global_dashboard else selected_db_id),
+        is_global_dashboard=is_global_dashboard,
         now=datetime.now(),
     )
 

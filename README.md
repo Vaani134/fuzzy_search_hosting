@@ -1,221 +1,395 @@
 # Fuzzy Search Hosting
 
-Production-oriented Flask search platform with:
-- Multi-database MySQL → SQLite sync
-- Database-isolated indexing and search (`db_id`)
-- Fuzzy ranking (RapidFuzz), synonyms, autocomplete, image-search, analytics
-- Live sync progress/log/error observability
+Production-grade multi-database fuzzy search platform built with Flask + SQLite + RapidFuzz.
 
-## 1. What Changed (Latest)
+**Key capabilities:**
+- MySQL → SQLite incremental sync with per-database isolation and crash-resume
+- Fuzzy search (RapidFuzz blend + composite ranking) per isolated DB or globally
+- Persistent engine disk cache — 80–95% faster cold starts
+- Query result cache (Redis / in-memory LRU) with hit/miss tracking
+- In-memory TTL autocomplete cache (30s, 500-entry LRU)
+- Incremental in-memory index updates — no full rebuild on small sync batches
+- Per-source priority boosting in global search
+- Comprehensive metrics: P50/P95/P99 latency, cache hit rates, rebuild counters
+- Autocomplete, synonyms, image search, click/popularity ranking, analytics
 
-This project now enforces **source isolation** across sync, index, and search:
-- Each connected source DB is identified by `connected_databases.id` (`db_id`).
-- Synced rows are scoped with `source_db_id`.
-- Search index instances are now **per database** (`get_engine(source_db_id=...)`).
-- Search, autocomplete, rebuild, image-search support `db_id`.
-- Search UI now has a **database dropdown** to switch sources visually.
+---
 
-## 2. High-Level Architecture
+## 1. High-Level Architecture
 
-1. MySQL source DB(s) are configured in `connected_databases`.
-2. `modules/sync_manager.py` syncs core tables + product metrics into local SQLite.
-3. Data is isolated per source using `source_db_id` and scoped IDs.
-4. `modules/fuzzy_search.py` builds in-memory index per `db_id`.
-5. API/UI query the selected database index and rows only.
-
-## 3. Repository Structure
-
-```text
-.
-├─ app.py
-├─ config.py
-├─ requirements.txt
-├─ SYNC_SYSTEM.md
-├─ db/
-│  ├─ database.py
-│  ├─ schema.sql
-│  └─ local.sqbpro
-├─ modules/
-│  ├─ fuzzy_search.py
-│  ├─ sync_manager.py
-│  ├─ sync_normalization.py
-│  ├─ sync_errors.py
-│  ├─ sync_live_logs.py
-│  ├─ sync_checkpoints.py
-│  ├─ db_manager.py
-│  ├─ settings_manager.py
-│  ├─ analytics.py
-│  ├─ cache.py
-│  ├─ autocomplete.py
-│  ├─ image_search.py
-│  ├─ synonym_suggester.py
-│  ├─ zip_builder.py
-│  └─ sync.py            # legacy sync path kept for compatibility
-├─ routes/
-│  ├─ search_routes.py
-│  ├─ synonym_routes.py
-│  └─ image_search_routes.py
-└─ templates/
-   ├─ index.html
-   ├─ sync.html
-   ├─ settings.html
-   ├─ dashboard.html
-   └─ ...
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                       Flask Application (app.py)                   │
+│  ┌───────────┐   ┌──────────────┐   ┌───────────────────────────┐  │
+│  │ Search UI │   │ Synonym Mgmt │   │  Multi-DB Sync Control    │  │
+│  └─────┬─────┘   └──────────────┘   └──────────────┬────────────┘  │
+│        │                                             │               │
+│  ┌─────▼─────────────────────────────────────────────▼───────────┐  │
+│  │              routes/search_routes.py  (API)                    │  │
+│  │  • latency tracking (time.perf_counter)                        │  │
+│  │  • query cache hit/miss → modules/metrics.py                   │  │
+│  │  • autocomplete latency → modules/metrics.py                   │  │
+│  └────────────────────────────┬───────────────────────────────────┘  │
+│                                │                                      │
+│  ┌─────────────────────────────▼────────────────────────────────┐    │
+│  │              modules/fuzzy_search.py                          │    │
+│  │                                                               │    │
+│  │  get_engine(db_id)           get_global_engine()             │    │
+│  │       │                              │                        │    │
+│  │  Isolated Engine              Global Engine                  │    │
+│  │  (one per source DB)       (all DBs merged; source priority) │    │
+│  │       │                              │                        │    │
+│  │  ┌────▼──────────────────────────────▼──────┐                │    │
+│  │  │          Disk Cache Layer                 │                │    │
+│  │  │     modules/cache_manager.py              │                │    │
+│  │  │  cache/db_1/engine.pkl.gz                 │                │    │
+│  │  │  cache/db_2/engine.pkl.gz                 │                │    │
+│  │  │  cache/global/engine.pkl.gz               │                │    │
+│  │  └───────────────────────────────────────────┘                │    │
+│  │                                                               │    │
+│  │  update_products_incremental(ids) — merge subset, no rebuild  │    │
+│  │  remove_products(ids)             — drop from in-memory index │    │
+│  └───────────────────────────────────────────────────────────────┘    │
+│                                                                        │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │  modules/query result cache: modules/cache.py (Redis/memory)  │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                        │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │  modules/autocomplete.py — TTL cache (30s, 500-entry LRU)     │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                        │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │  modules/metrics.py — SearchMetrics singleton                  │   │
+│  │  • disk cache hits/misses  • query cache hits/misses           │   │
+│  │  • search latency P50/P95/P99  • autocomplete latency          │   │
+│  │  • rebuild count + duration percentiles                        │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                        │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │  modules/sync_manager.py  ←  MySQL source DBs                 │   │
+│  │  (incremental sync, crash-resume, per-DB isolation)           │   │
+│  │  → rebuilds engines + clears query & autocomplete caches      │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────────────────┘
+                              │ SQLite  db/local.db
 ```
 
-## 4. Core Data Model (SQLite)
+---
 
-Main entities:
-- Catalog tables: `brands`, `categories`, `product_group`, `products`
-- Source registry: `connected_databases`
-- Sync tracking: `sync_jobs`, `sync_checkpoints`, `sync_log`, `sync_errors`
-- Ranking signal: `product_metrics`
-- Search analytics: `search_history`
-- Synonyms: `synonyms`, `synonym_suggestions`
-- Click signal: `product_clicks`
+## 2. Scoring & Ranking
 
-Isolation details:
-- `products`, `brands`, `categories`, `product_group` contain `source_db_id`.
-- Sync writes scoped IDs per source to avoid collisions across databases.
-- `product_metrics` uses `(product_id, source_db_id)` uniqueness.
+### Fuzzy blend (per product)
+```
+blend = 0.5 × token_set_ratio + 0.3 × WRatio + 0.2 × partial_ratio
+```
+Scored against both normalised and raw text; higher wins.
 
-## 5. Sync Logic
+### Boost rules (applied on top of blend, capped at 100)
+| Condition | Boost |
+|-----------|-------|
+| Exact match (normalised) | +20 |
+| Starts-with match | +10 |
+| Query is substring of raw name | +10 |
 
-Entry point:
-- `POST /api/database/<db_id>/sync` (full/incremental)
+### Composite ranking (relevance-first)
+```
+gap = best_fuzzy_in_results − this_product_fuzzy
 
-Behavior:
-- Creates `sync_jobs` row, initializes live state/log stream.
-- Full sync deletes rows for that `source_db_id` then imports all rows.
-- Incremental sync uses dual-key cursor (`updated_at`, `id`) for gap-free progress.
-- Per-row error isolation logs bad rows to `sync_errors` without aborting table.
-- On successful full sync: rebuilds index for that specific `db_id`.
+if gap > 10:          final = fuzzy + source_priority          # clear winner
+else:                  final = 0.85×fuzzy + 0.10×popularity
+                             + 0.05×click_rate + source_priority  # tie band
+```
 
-Recovery:
-- On app startup, stale `running` jobs are marked failed.
-- API prevents duplicate runs by checking both live state and DB job state.
+`source_priority` is the per-DB boost from `SEARCH_SOURCE_PRIORITY` config and is only applied in global search mode. This ensures popular products never outscore clearly more relevant ones, while equally good matches from a preferred source float to the top.
 
-## 6. Search, Index, Ranking
+---
 
-Engine:
-- `modules/fuzzy_search.py` maintains **per-db** in-memory engine instances.
-- Query path passes `db_id` so only that source index is used.
+## 3. Disk Cache Layer
 
-Scoring:
-- RapidFuzz blend + boost + composite ranking
-- Popularity signal from `product_metrics`
-- Click signal from `product_clicks`
+Persistent gzip+pickle cache for the in-memory search index.
 
-Related features:
-- Synonym normalization (`synonyms` table, hot reload)
-- Query suggestion ("Did You Mean")
-- Autocomplete filtered by `source_db_id`
-- Image-search pipeline can search per `db_id`
+### Directory layout
+```
+cache/
+  global/
+    engine.pkl.gz    ← serialised FuzzySearchEngine state
+    metadata.json    ← version, product count, checksum, built_at
+  db_1/
+    engine.pkl.gz
+    metadata.json
+  db_2/
+    engine.pkl.gz
+    metadata.json
+```
 
-## 7. UI Pages
+### 7-gate validation (all must pass to use cache)
+| Gate | Check |
+|------|-------|
+| 1 | metadata.json is readable and valid JSON |
+| 2 | `cache_version` matches `CACHE_VERSION` env var |
+| 3 | `schema_version` matches internal `_SCHEMA_VERSION` |
+| 4 | Age < `CACHE_MAX_AGE` seconds (default 7 days) |
+| 5 | Product count in SQLite matches `product_count` in metadata |
+| 6 | engine.pkl.gz file exists |
+| 7 | SHA-256 checksum of engine.pkl.gz matches `checksum` in metadata |
 
-- `/` Dashboard
-- `/search` Main search page (now includes database dropdown selector)
-- `/product/<id>` Product detail
-- `/sync` Multi-database sync control + live status/log/errors
-- `/settings` DB connection/settings screen
-- `/analytics` Search analytics page
+### Atomic writes
+Cache files are written to a `.tmp` suffix first, then renamed via `os.replace()`. This prevents a crash mid-write from corrupting the live cache file.
 
-## 8. API Reference (Current)
+### Startup cleanup
+On startup, `AUTO_CLEANUP=true` (default) calls `cleanup_stale_tmp_files(CACHE_DIR)` to remove any orphaned `.tmp` files left by a previous interrupted write.
 
-### Search APIs (`routes/search_routes.py`)
+---
 
-- `GET /api/search`  
-  Params: `q` (required), `db_id` (default `1`), `page`, `limit`, `sort`, `category`, `min_price`, `max_price`
-- `POST /api/search/rebuild`  
-  Params: optional `db_id` query param
-- `GET /api/autocomplete`  
-  Params: `q`, `db_id`, `limit`
-- `GET /api/search/history`
-- `GET /api/search/top`
-- `GET /api/search/zero-results`
-- `GET /api/search/trending`
-- `GET /api/cache/stats`
-- `POST /api/cache/clear`
+## 4. Query Result Cache
 
-### Image Search API (`routes/image_search_routes.py`)
+Short-term in-memory (or Redis) cache for search API responses.
 
-- `POST /api/image-search`  
-  Multipart image upload, supports `top_k`, `db_id`
+- **Backend**: Redis when `REDIS_URL` is set and reachable; falls back to in-memory dict automatically.
+- **Key**: `hash(query + filters + page + limit + sort + db_id)`
+- **Invalidated**: automatically cleared after every successful sync via `search_cache.clear()`.
+- **Metrics**: every cache access increments `search_metrics.record_query_cache_hit/miss()`.
 
-### Synonym APIs (`routes/synonym_routes.py`)
+---
 
-- `GET /api/synonyms`
-- `POST /api/synonyms/add`
-- `DELETE /api/synonyms/<id>`
-- `POST /api/synonyms/suggest`
-- `GET /api/synonyms/suggestions`
-- `GET /api/synonyms/suggestions/all`
-- `POST /api/synonyms/approve/<id>`
-- `POST /api/synonyms/reject/<id>`
+## 5. Autocomplete Cache
 
-### Multi-Database APIs (`app.py`)
+In-process TTL cache inside `modules/autocomplete.py`.
 
-- `GET /api/databases`
-- `POST /api/databases`
-- `GET /api/database/<db_id>`
-- `PUT /api/database/<db_id>`
-- `DELETE /api/database/<db_id>`
-- `POST /api/database/<db_id>/test`
-- `POST /api/database/<db_id>/sync`
-- `POST /api/database/<db_id>/stop`
-- `GET /api/database/<db_id>/status`
-- `GET /api/database/<db_id>/logs`
-- `GET /api/database/<db_id>/errors`
-- `GET /api/databases/live`
+- **Structure**: `OrderedDict` with `(normalised_query, limit, source_db_id)` keys → `(results, expiry)` values.
+- **TTL**: 30 seconds (configurable via `_CACHE_TTL`).
+- **Capacity**: 500 entries; LRU eviction when full (oldest entry popped from front).
+- **Invalidated**: `invalidate_autocomplete_cache()` is called by `sync_manager._trigger_index_rebuild()` after every successful sync.
+- **Thread-safe**: single `threading.Lock` guards all reads and writes.
 
-### Other APIs (`app.py`)
+---
 
-- `GET /api/product/<id>`
-- `POST /api/product/<id>/click`
-- `GET /api/stats` (supports `db_id`)
-- `POST /api/download-zip`
+## 6. Incremental Index Updates
 
-### Legacy APIs (kept for compatibility)
+Instead of a full SQLite rebuild, individual products can be merged into the live index:
 
-- `POST /api/sync`
-- `GET /api/sync/live`
-- `GET /api/sync/history`
-- `GET /api/sync/status`
-- `GET /api/settings`
-- `POST /api/settings`
-- `POST /api/settings/test`
+```python
+engine = get_engine(source_db_id=1)
+engine.update_products_incremental([scoped_id_1, scoped_id_2])  # fetch + merge
+engine.remove_products([scoped_id_3])                            # drop from index
+```
 
-## 9. Setup
+After `update_products_incremental`, popularity and click signals are re-normalised across the entire in-memory corpus using `_renormalize_signals()` — no DB query needed.
+
+---
+
+## 7. Metrics & Observability
+
+`GET /api/cache/stats` returns a comprehensive JSON snapshot:
+
+```json
+{
+  "query_cache": {
+    "hits": 1240, "misses": 88, "hit_rate_pct": 93.4, "size": 52
+  },
+  "disk_cache": {
+    "global": {"cached": true, "product_count": 60000, "built_at": "...", "size_bytes": 12000000},
+    "db_1":   {"cached": true, "product_count": 42000, "built_at": "...", "size_bytes": 8500000},
+    "db_2":   {"cached": true, "product_count": 18000, "built_at": "...", "size_bytes": 3800000}
+  },
+  "engines": {
+    "db_1":   {"mode": "isolated", "total_products": 42000, "last_built": 1716400000.0},
+    "global": {"mode": "global",   "total_products": 60000, "last_built": 1716400001.2}
+  },
+  "metrics": {
+    "uptime_seconds": 3600.0,
+    "disk_cache":  {"hits": 3, "misses": 0, "hit_rate_pct": 100.0},
+    "query_cache": {"hits": 1240, "misses": 88, "hit_rate_pct": 93.4},
+    "searches": {
+      "total": 1328, "zero_results": 12,
+      "latency_p50_ms": 4.2, "latency_p95_ms": 18.7, "latency_p99_ms": 45.1,
+      "latency_avg_ms": 6.1, "latency_samples": 1000
+    },
+    "autocomplete": {
+      "latency_p50_ms": 0.8, "latency_p95_ms": 3.2,
+      "latency_p99_ms": 9.1, "latency_avg_ms": 1.1, "latency_samples": 800
+    },
+    "rebuilds": {
+      "count": 3, "last_ms": 4210.0,
+      "duration_p50_ms": 3800.0, "duration_p95_ms": 5200.0,
+      "duration_p99_ms": 5200.0, "duration_avg_ms": 4070.0, "duration_samples": 3
+    }
+  }
+}
+```
+
+### Metrics rolling windows
+| Window | Max samples | Percentiles |
+|--------|-------------|-------------|
+| Search latency | 1000 (configurable via `METRICS_LATENCY_WINDOW`) | P50, P95, P99, avg |
+| Autocomplete latency | 1000 | P50, P95, P99, avg |
+| Rebuild duration | 100 | P50, P95, P99, avg |
+
+---
+
+## 8. Sync Lifecycle
+
+```
+POST /api/database/<id>/sync
+         │
+         ▼
+  sync_manager.sync_database_background()
+         │
+         ▼
+  ┌──────────────────────────────────────────────────────┐
+  │  1. Create sync_jobs row (status=running)            │
+  │  2. Detect full vs incremental vs crash-resume       │
+  │  3. Sync brands → categories → product_group         │
+  │     → products  (dual-key cursor, batched)           │
+  │  4. Sync product_metrics (aggregate from MySQL)      │
+  │  5. Mark job completed, update last_sync_at          │
+  │  6. Rebuild isolated engine (get_engine(db_id))      │
+  │  7. Rebuild global engine   (rebuild_global_index()) │
+  │  8. Clear query result cache (search_cache.clear())  │
+  │  9. Clear autocomplete cache (invalidate_...)        │
+  └──────────────────────────────────────────────────────┘
+```
+
+Steps 6–9 only run on a **successful** sync. Partial, stopped, or failed syncs do not rebuild — the existing index continues serving queries uninterrupted.
+
+---
+
+## 9. Cold-Start Sequence
+
+```
+app.py starts
+    │
+    ├── init_db()                          — ensure SQLite schema exists
+    ├── seed_primary_database_from_settings()
+    ├── _cleanup_stale_running_sync_jobs()
+    ├── cleanup_stale_tmp_files(CACHE_DIR)  — AUTO_CLEANUP (removes .tmp leftovers)
+    ├── reload_synonyms()
+    │
+    └── get_engine(source_db_id=1)
+            │
+            ├── _load_from_cache()
+            │       │
+            │       ├── CACHE_ENABLED=false? → return False
+            │       ├── 7-gate validation fails? → miss (record_disk_cache_miss)
+            │       ├── PASS → load pkl.gz → record_disk_cache_hit → return True
+            │       └── Exception → miss (record_disk_cache_miss) → return False
+            │
+            └── (on cache miss) rebuild()
+                    │
+                    ├── _load_products_from_db()   (full table scan)
+                    ├── normalise signals (min-max)
+                    ├── build raw + normalised string arrays
+                    ├── record_rebuild(duration_ms)
+                    └── _save_to_cache()           (atomic write to .tmp → rename)
+```
+
+**Typical startup times (42k products):**
+| Scenario | Time |
+|----------|------|
+| Warm cache (valid pkl.gz) | ~0.3 s |
+| Cold start (SQLite rebuild) | ~4–6 s |
+| Cache invalidated after sync | 4–6 s (one-time, then warm) |
+
+---
+
+## 10. Configuration Reference
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CACHE_ENABLED` | `true` | Enable/disable disk cache |
+| `CACHE_DIR` | `cache/` | Directory for engine cache files |
+| `CACHE_COMPRESSION` | `true` | Gzip compress engine cache |
+| `CACHE_VERSION` | `1` | Bump to force global cache invalidation |
+| `CACHE_MAX_AGE` | `604800` (7 days) | Max cache age in seconds; `0` = no limit |
+| `AUTO_CLEANUP` | `true` | Remove orphaned `.tmp` files on startup |
+| `METRICS_LATENCY_WINDOW` | `1000` | Rolling window size for latency percentiles |
+| `SEARCH_SOURCE_PRIORITY` | `{}` | JSON map of `db_id → float` priority boost |
+| `REDIS_URL` | `` | Redis URL for query cache; empty = in-memory |
+| `REDIS_KEY_PREFIX` | `fzsearch:` | Key prefix for Redis cache entries |
+| `SEARCH_MIN_SCORE` | `35.0` | Minimum composite score to include in results |
+| `SEARCH_DEFAULT_K` | `20` | Default result count |
+| `SEARCH_MAX_K` | `100` | Hard cap on result count |
+| `SYNC_BATCH_SIZE` | `2000` | Rows per MySQL fetch batch during sync |
+
+### SEARCH_SOURCE_PRIORITY example
+```bash
+export SEARCH_SOURCE_PRIORITY='{"1": 5.0, "2": 0.0}'
+```
+This boosts DB-1 results by 5 points in global search scoring. Only applied in global mode (`?db_id=all`); isolated per-DB searches are unaffected.
+
+---
+
+## 11. API Reference
+
+### Search
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/search?q=...` | Paginated fuzzy search |
+| GET | `/api/search?q=...&db_id=all` | Global search across all DBs |
+| GET | `/api/autocomplete?q=...` | Autocomplete suggestions (TTL cached) |
+| GET | `/api/search/history` | Recent search queries |
+| GET | `/api/search/top` | Most-searched queries |
+| GET | `/api/search/zero-results` | Queries returning no results |
+| GET | `/api/search/trending` | Queries trending in last N hours |
+| POST | `/api/search/rebuild` | Rebuild in-memory index |
+
+### Cache & Metrics
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/cache/stats` | Full cache + metrics snapshot |
+| POST | `/api/cache/clear` | Flush query result cache |
+
+### Sync
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/database/<id>/sync` | Start sync (full or incremental) |
+| POST | `/api/database/<id>/stop` | Graceful stop |
+| GET | `/api/database/<id>/status` | Live sync state + job history |
+| GET | `/api/database/<id>/logs` | Real-time sync log buffer |
+| GET | `/api/database/<id>/errors` | Row-level sync errors |
+
+---
+
+## 12. Production Deployment
 
 ### Requirements
+```
+flask
+rapidfuzz
+pymysql
+```
+Optional: `redis` (for distributed query cache across workers).
 
-- Python 3.10+
-- SQLite (bundled with Python)
-- MySQL source access (for sync)
-- Optional Redis for cache backend
-
-### Install
-
+### Environment
 ```bash
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-python app.py
+export SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+export FLASK_ENV=production
+export REDIS_URL=redis://localhost:6379/0   # optional
+export CACHE_ENABLED=true
+export AUTO_CLEANUP=true
 ```
 
-## 10. Operational Notes
+### Thread safety
+- `FuzzySearchEngine._lock` is a `threading.RLock` — re-entrant safe for nested calls.
+- `CacheManager` uses per-slot `threading.Lock` — concurrent read/write to the same slot is serialized.
+- `SearchMetrics` uses a single `threading.Lock` — all counter increments are O(1).
+- `autocomplete._cache_lock` is a `threading.Lock` — OrderedDict mutations are atomic.
 
-- After introducing isolation changes, run **one full sync per database**.
-- Use `/search?db_id=<id>&q=...` to query a specific source directly.
-- Search page dropdown now does this automatically.
-- Incremental sync does not always rebuild index; use `POST /api/search/rebuild?db_id=<id>` when needed.
+### Scaling notes
+- All caches are **process-local**. Multi-worker deployments (gunicorn) require Redis (`REDIS_URL`) for the query cache; the disk cache and autocomplete cache are per-process but idempotent.
+- The disk cache is write-safe across concurrent startups because of atomic `os.replace()` writes.
+- Set `METRICS_LATENCY_WINDOW` lower (e.g. `200`) on memory-constrained deployments.
 
-## 11. Key Files to Read First
+---
 
-- `app.py` (route composition and startup behavior)
-- `modules/sync_manager.py` (sync engine + checkpoints + logs)
-- `modules/fuzzy_search.py` (indexing and ranking)
-- `routes/search_routes.py` (search API contracts)
-- `templates/index.html` (search UI, db selector)
-- `SYNC_SYSTEM.md` (deep sync internals)
+## 13. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| Slow cold starts every restart | Cache disabled or always invalidating | Check `CACHE_ENABLED`, `CACHE_VERSION`, `CACHE_MAX_AGE` |
+| Search returns stale products | Query cache not cleared after sync | Verify sync completed successfully (`status: ok`) |
+| Autocomplete shows old data | Autocomplete cache not invalidated | Check sync succeeded; TTL expires in 30s anyway |
+| `GET /api/cache/stats` shows 0 latency samples | No searches run yet | Normal — percentiles populate after first queries |
+| `disk_cache_miss` counter rising | Cache corrupted / schema changed | Bump `CACHE_VERSION` to invalidate all slots |
+| `.tmp` files accumulating | Server crashed during cache write | Set `AUTO_CLEANUP=true` and restart |

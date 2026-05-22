@@ -1,7 +1,7 @@
 """
 modules/autocomplete.py
 -----------------------
-Fast SQLite-backed autocomplete / search suggestions.
+Fast SQLite-backed autocomplete / search suggestions with an in-memory TTL cache.
 
 Returns up to `limit` suggestions from:
   - product names
@@ -10,41 +10,106 @@ Returns up to `limit` suggestions from:
 
 Strategy: prefix match first (fastest), then LIKE fallback for mid-word.
 Results are deduplicated and ranked: exact prefix > contains.
+
+Cache
+-----
+Results are stored in a bounded OrderedDict with TTL expiry so repeated
+keystrokes (e.g. typing "hook" then "hooka") hit memory instead of SQLite.
+  _CACHE_TTL  — seconds before an entry expires (default 30)
+  _CACHE_MAX  — maximum number of cached query tuples (default 500)
+When the cache is full, the least-recently-used entry is evicted (LRU policy).
+Call invalidate_autocomplete_cache() after a sync to force fresh results.
 """
 
 import re
 import sys
 import os
+import threading
+import time
+from collections import OrderedDict
 from typing import List, Dict, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.database import get_connection
 
 
+# ── In-memory TTL cache ────────────────────────────────────────────────────────
+
+_cache: OrderedDict = OrderedDict()   # key → (results_list, expiry_monotonic)
+_cache_lock = threading.Lock()
+_CACHE_TTL: float = 30.0   # cache entry lifetime in seconds
+_CACHE_MAX: int   = 500    # max cached query tuples (LRU eviction beyond this)
+
+
+def _cache_get(key: tuple) -> Optional[List[Dict]]:
+    """Return cached results for *key*, or None on cache miss or expiry."""
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry is None:
+            return None
+        results, expiry = entry
+        if time.monotonic() > expiry:
+            del _cache[key]
+            return None
+        _cache.move_to_end(key)
+        return results
+
+
+def _cache_put(key: tuple, results: List[Dict]) -> None:
+    """Insert *results* into the cache; evict LRU entries when over capacity."""
+    expiry = time.monotonic() + _CACHE_TTL
+    with _cache_lock:
+        if key in _cache:
+            _cache.move_to_end(key)
+        _cache[key] = (results, expiry)
+        while len(_cache) > _CACHE_MAX:
+            _cache.popitem(last=False)
+
+
+def invalidate_autocomplete_cache() -> None:
+    """Clear the entire in-memory autocomplete cache (call after a sync)."""
+    with _cache_lock:
+        _cache.clear()
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
 def _normalize(text: str) -> str:
     """Lowercase and collapse whitespace."""
     return re.sub(r"\s+", " ", text.lower().strip())
 
 
+# ── Public API ─────────────────────────────────────────────────────────────────
+
 def get_suggestions(query: str, limit: int = 10, source_db_id: Optional[int] = 1) -> List[Dict]:
     """
     Return autocomplete suggestions for `query`.
 
+    Results are served from the in-memory TTL cache when available.
+    Cache key: (normalised_query, limit, source_db_id).
+
     Each suggestion dict:
-        text   — display text
-        type   — "product" | "brand" | "category"
-        id     — record id (for direct navigation on product suggestions)
+        text          — display text
+        type          — "product" | "brand" | "category"
+        id            — record id (for direct navigation on product suggestions)
+        source_db_id  — originating database
+        priority      — 1=product-prefix, 2=brand, 3=category, 4=product-contains
     """
     query = query.strip()
     if not query or len(query) < 2:
         return []
 
-    q_like_prefix  = query + "%"          # starts with
-    q_like_contains = "%" + query + "%"   # contains anywhere
+    cache_key = (_normalize(query), limit, source_db_id)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    q_like_prefix   = query + "%"
+    q_like_contains = "%" + query + "%"
 
     conn = get_connection()
     results = []
-    seen = set()
+    seen: set = set()
 
     try:
         # ── 1. Product names — prefix match (highest priority) ────────────────
@@ -144,6 +209,7 @@ def get_suggestions(query: str, limit: int = 10, source_db_id: Optional[int] = 1
     finally:
         conn.close()
 
-    # Sort: priority asc, then alphabetical
     results.sort(key=lambda x: (x["priority"], x["text"].lower()))
-    return results[:limit]
+    final = results[:limit]
+    _cache_put(cache_key, final)
+    return final

@@ -46,8 +46,19 @@
     <h2 class="fw-bold mb-0"><i class="bi bi-speedometer2 text-primary me-2"></i>Dashboard</h2>
     <small class="text-muted">Live data from SQLite cache &bull; Last updated {{ now.strftime('%b %d, %Y %H:%M') }}</small>
   </div>
+  <form method="GET" action="/" class="d-flex align-items-center gap-2">
+    <label for="dash-db-id" class="text-muted small mb-0">Database</label>
+    <select id="dash-db-id" name="db_id" class="form-select form-select-sm" onchange="this.form.submit()">
+      <option value="all" {% if selected_db_id == 'all' %}selected{% endif %}>All Databases</option>
+      {% for db in databases %}
+      <option value="{{ db.id }}" {% if db.id == selected_db_id %}selected{% endif %}>
+        {{ db.name }} (ID {{ db.id }})
+      </option>
+      {% endfor %}
+    </select>
+  </form>
   <div class="d-flex gap-2">
-    <a href="/search" class="btn btn-primary">
+    <a href="/search?db_id={{ selected_db_id }}" class="btn btn-primary">
       <i class="bi bi-search me-1"></i>Search Products
     </a>
     <button class="btn btn-outline-primary" id="btnDashRebuild" title="Drop old index and rebuild from SQLite">
@@ -328,7 +339,7 @@
 
 </div>
 
-<!-- ── Bottom row: sync status + recent transactions ── -->
+<!-- ── Bottom row: sync status ── -->
 <div class="row g-4">
 
   <!-- Sync status -->
@@ -380,62 +391,6 @@
     </div>
   </div>
 
-  <!-- Recent transactions -->
-  <div class="col-md-7">
-    <div class="card shadow-sm border-0 h-100">
-      <div class="card-body">
-        <h6 class="fw-bold mb-3">
-          <i class="bi bi-receipt text-info me-2"></i>Recent Transactions
-        </h6>
-        {% if recent_transactions %}
-        <div class="table-responsive">
-          <table class="table table-sm table-hover mb-0">
-            <thead class="table-light">
-              <tr>
-                <th>Invoice</th>
-                <th>Type</th>
-                <th>Status</th>
-                <th>Payment</th>
-                <th class="text-end">Total</th>
-                <th>Date</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for t in recent_transactions %}
-              <tr>
-                <td><small>{{ t.invoice_no or '—' }}</small></td>
-                <td><span class="badge bg-secondary">{{ t.type or '—' }}</span></td>
-                <td><small>{{ t.status }}</small></td>
-                <td>
-                  {% if t.payment_status == 'paid' %}
-                  <span class="badge bg-success">paid</span>
-                  {% elif t.payment_status == 'due' %}
-                  <span class="badge bg-danger">due</span>
-                  {% elif t.payment_status == 'partial' %}
-                  <span class="badge bg-warning text-dark">partial</span>
-                  {% else %}
-                  <span class="text-muted">—</span>
-                  {% endif %}
-                </td>
-                <td class="text-end fw-bold">
-                  {% if t.final_total %}${{ "%.2f"|format(t.final_total) }}{% else %}—{% endif %}
-                </td>
-                <td><small class="text-muted">{{ t.transaction_date[:10] if t.transaction_date else '—' }}</small></td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-        {% else %}
-        <div class="text-center py-4 text-muted">
-          <i class="bi bi-receipt" style="font-size:2.5rem; opacity:.3;"></i>
-          <p class="mt-2 small">No transactions synced yet.</p>
-        </div>
-        {% endif %}
-      </div>
-    </div>
-  </div>
-
 </div>
 
 {% endblock %}
@@ -465,7 +420,8 @@
     </span>`;
 
     try {
-      const resp = await fetch("/api/search/rebuild", { method: "POST" });
+      const rebuildUrl = {{ "'/api/search/rebuild-global'" if selected_db_id == 'all' else "'/api/search/rebuild?db_id=" ~ selected_db_id ~ "'" }};
+      const resp = await fetch(rebuildUrl, { method: "POST" });
       const data = await resp.json();
       const newCount = data.indexed || 0;
 

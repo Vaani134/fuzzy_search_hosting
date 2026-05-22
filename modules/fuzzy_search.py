@@ -45,8 +45,13 @@ import os
 from typing import List, Dict, Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import SEARCH_MIN_SCORE, SEARCH_DEFAULT_K, SEARCH_MAX_K
+from config import SEARCH_MIN_SCORE, SEARCH_DEFAULT_K, SEARCH_MAX_K, SEARCH_SOURCE_PRIORITY
 from db.database import get_connection
+
+try:
+    from modules.metrics import search_metrics as _search_metrics
+except ImportError:
+    _search_metrics = None
 
 try:
     from rapidfuzz import fuzz, process
@@ -596,6 +601,7 @@ def _composite_score(
     popularity: float,
     click_rate: float,
     best_fuzzy_in_results: float = 0.0,
+    source_priority: float = 0.0,
 ) -> float:
     """
     Combine three normalised signals (each 0–100) into a single ranking score.
@@ -609,19 +615,21 @@ def _composite_score(
 
     Formula (tie band — fuzzy scores are close)
     -------------------------------------------
-    final = 0.85 × fuzzy + 0.10 × popularity + 0.05 × click_rate
+    final = 0.85 × fuzzy + 0.10 × popularity + 0.05 × click_rate + source_priority
 
     Formula (clear winner — fuzzy gap > FUZZY_TIE_BAND)
     ----------------------------------------------------
-    final = fuzzy   (popularity and click signals ignored)
+    final = fuzzy + source_priority   (popularity and click signals ignored)
 
     Weight rationale
     ----------------
-    0.85  fuzzy_score  — relevance is the dominant signal.  Raised from 0.7
-                         to ensure a clearly more relevant product always wins.
-    0.10  popularity   — secondary tie-breaker.  Reduced from 0.2 so it cannot
-                         override a 10-point fuzzy advantage.
-    0.05  click_rate   — tertiary tie-breaker.  Reduced from 0.1.
+    0.85  fuzzy_score     — relevance is the dominant signal.
+    0.10  popularity      — secondary tie-breaker.
+    0.05  click_rate      — tertiary tie-breaker.
+    source_priority       — optional per-DB boost from SEARCH_SOURCE_PRIORITY config.
+                            Applied after all other signals so relevance is never
+                            overridden, but equal-quality results from a preferred
+                            source float to the top.
 
     Parameters
     ----------
@@ -631,16 +639,15 @@ def _composite_score(
     best_fuzzy_in_results  : highest fuzzy score across all candidates in this
                              search.  Used to determine whether this product is
                              in the tie band or clearly behind.
+    source_priority        : additive boost from SEARCH_SOURCE_PRIORITY[source_db_id].
+                             Only non-zero for global engine searches.
     """
     gap = best_fuzzy_in_results - fuzzy
 
     if gap > FUZZY_TIE_BAND:
-        # This product is clearly less relevant than the best match.
-        # Popularity and clicks cannot rescue it — rank on fuzzy alone.
-        return min(round(fuzzy, 2), 100.0)
+        return min(round(fuzzy + source_priority, 2), 100.0)
 
-    # Products within the tie band: apply the full composite formula.
-    raw = 0.85 * fuzzy + 0.10 * popularity + 0.05 * click_rate
+    raw = 0.85 * fuzzy + 0.10 * popularity + 0.05 * click_rate + source_priority
     return min(round(raw, 2), 100.0)
 
 
@@ -684,16 +691,108 @@ class FuzzySearchEngine:
         self._lock                = threading.RLock()
         self._last_built:         Optional[float] = None
 
-        # Build index on startup
-        self.rebuild()
+        # Build index on startup — try disk cache first for instant startup.
+        # Falls back to a full SQLite rebuild if the cache is missing/stale/corrupt.
+        if not self._load_from_cache():
+            self.rebuild()
 
         # Start background refresh thread if interval is set
         if rebuild_interval:
             self._start_background_refresh()
 
+    # ── Disk cache integration ─────────────────────────────────────────────────
+
+    def _load_from_cache(self) -> bool:
+        """
+        Try to populate the engine from the persistent disk cache.
+
+        Returns True and updates ``_items``, ``_raw_strings``,
+        ``_normalized_strings``, and ``_last_built`` on a cache hit.
+        Returns False on a miss, a failed validation, or any exception —
+        the caller must then call ``rebuild()`` to build from SQLite.
+
+        Errors are caught and printed; they never propagate to the caller.
+        """
+        try:
+            from config import CACHE_ENABLED
+            if not CACHE_ENABLED:
+                return False
+        except ImportError:
+            return False
+
+        try:
+            from modules.cache_manager import get_cache_manager
+            mgr  = get_cache_manager(self.source_db_id)
+            data = mgr.load_engine_data()
+            if data is None:
+                if _search_metrics:
+                    _search_metrics.record_disk_cache_miss()
+                return False
+
+            with self._lock:
+                self._items              = data["items"]
+                self._raw_strings        = data["raw_strings"]
+                self._normalized_strings = data["normalized_strings"]
+                self._last_built         = data.get("last_built", time.time())
+
+            if _search_metrics:
+                _search_metrics.record_disk_cache_hit()
+            label = "global" if self.is_global else f"db_id={self.source_db_id}"
+            print(
+                f"[Search] Cache HIT ({label}): "
+                f"{len(self._items)} products loaded from disk."
+            )
+            return True
+
+        except Exception as exc:
+            if _search_metrics:
+                _search_metrics.record_disk_cache_miss()
+            label = "global" if self.is_global else f"db_id={self.source_db_id}"
+            print(f"[Search] Cache load failed ({label}): {exc} — will rebuild from DB.")
+            return False
+
+    def _save_to_cache(
+        self,
+        items: List[Dict[str, Any]],
+        raw_strings: List[str],
+        normalized_strings: List[str],
+        last_built: float,
+    ) -> None:
+        """
+        Persist the current in-memory index to the disk cache.
+
+        Runs synchronously (the caller — rebuild() — is already executing in
+        a background thread during sync, or in a dedicated request for the
+        manual rebuild endpoint).  Errors are caught and logged; they never
+        surface to callers or interrupt search availability.
+        """
+        try:
+            from config import CACHE_ENABLED
+            if not CACHE_ENABLED:
+                return
+        except ImportError:
+            return
+
+        try:
+            from modules.cache_manager import get_cache_manager
+            mgr  = get_cache_manager(self.source_db_id)
+            data = {
+                "items":              items,
+                "raw_strings":        raw_strings,
+                "normalized_strings": normalized_strings,
+                "last_built":         last_built,
+            }
+            mgr.save_engine_data(data)
+        except Exception as exc:
+            label = "global" if self.is_global else f"db_id={self.source_db_id}"
+            print(f"[Search] Cache save failed ({label}): {exc}")
+
     # ── Index building ─────────────────────────────────────────────────────────
 
-    def _load_products_from_db(self) -> List[Dict[str, Any]]:
+    def _load_products_from_db(
+        self,
+        product_ids: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Load products from SQLite, joining brand, category names, and
         pre-aggregated ranking signals (popularity, click_count).
@@ -701,6 +800,13 @@ class FuzzySearchEngine:
         popularity  = number of transaction sell lines for this product
                       (proxy for historical sales volume)
         click_count = cumulative click-throughs from product_clicks table
+
+        Parameters
+        ----------
+        product_ids : list of int, optional
+            When provided, only fetch these specific product IDs (scoped p.id
+            values).  Used by update_products_incremental() to avoid a full
+            table scan when only a subset of products changed.
         """
         conn = get_connection()
         try:
@@ -755,6 +861,10 @@ class FuzzySearchEngine:
             if not self.is_global:
                 sql += " AND p.source_db_id = ?"
                 params.append(self.source_db_id)
+            if product_ids:
+                placeholders = ",".join("?" * len(product_ids))
+                sql += f" AND p.id IN ({placeholders})"
+                params.extend(product_ids)
             sql += " ORDER BY p.id"
             rows = conn.execute(sql, tuple(params)).fetchall()
             return [dict(r) for r in rows]
@@ -780,12 +890,143 @@ class FuzzySearchEngine:
             return [0.0] * len(values)
         return [round((v / max_val) * 100.0, 4) for v in values]
 
+    def _renormalize_signals(self) -> None:
+        """
+        Re-run min-max normalization on all in-memory items using the stored
+        raw signal values (popularity_raw, click_count_raw).
+
+        Called after update_products_incremental() merges new data into the
+        index so that the normalised _popularity and _click_rate values stay
+        consistent with the full corpus — no DB query required.
+
+        Thread-safe: acquires self._lock (RLock, so re-entrant if needed).
+        """
+        with self._lock:
+            if not self._items:
+                return
+            pop_raw   = [float(item.get("popularity_raw",  0) or 0) for item in self._items]
+            click_raw = [float(item.get("click_count_raw", 0) or 0) for item in self._items]
+            pop_norm   = self._normalise_signal(pop_raw)
+            click_norm = self._normalise_signal(click_raw)
+            for i, item in enumerate(self._items):
+                item["_popularity"] = pop_norm[i]
+                item["_click_rate"] = click_norm[i]
+
+    def update_products_incremental(self, scoped_product_ids: List[int]) -> int:
+        """
+        Fetch fresh data for the given product IDs and merge into the index.
+
+        This avoids a full SQLite table scan when only a small subset of
+        products was inserted or updated during an incremental sync.  Existing
+        entries are replaced in-place; new IDs are appended.
+
+        After merging, popularity and click signals are re-normalised across the
+        entire in-memory corpus so relative ordering remains correct.
+
+        Parameters
+        ----------
+        scoped_product_ids : list of int
+            The ``p.id`` values as stored in SQLite (already scoped with
+            source_db_id × _ID_SCOPE_MULTIPLIER for global engine rows, or the
+            original product IDs for per-DB engine rows).
+
+        Returns
+        -------
+        int — number of products inserted or updated.
+        """
+        if not scoped_product_ids:
+            return 0
+
+        new_items = self._load_products_from_db(product_ids=scoped_product_ids)
+        if not new_items:
+            return 0
+
+        new_raw_strs:  List[str] = []
+        new_norm_strs: List[str] = []
+        for item in new_items:
+            parts = [str(item.get(f, '') or '') for f in self.text_fields]
+            raw   = ' '.join(p for p in parts if p and p.lower() not in ('nan', 'none', ''))
+            new_raw_strs.append(raw)
+            new_norm_strs.append(normalize(raw))
+
+        with self._lock:
+            id_to_idx = {item["id"]: i for i, item in enumerate(self._items)}
+
+            for i, item in enumerate(new_items):
+                pid = item["id"]
+                if pid in id_to_idx:
+                    idx = id_to_idx[pid]
+                    self._items[idx]              = item
+                    self._raw_strings[idx]        = new_raw_strs[i]
+                    self._normalized_strings[idx] = new_norm_strs[i]
+                else:
+                    self._items.append(item)
+                    self._raw_strings.append(new_raw_strs[i])
+                    self._normalized_strings.append(new_norm_strs[i])
+
+        self._renormalize_signals()
+
+        label = "global" if self.is_global else f"db_id={self.source_db_id}"
+        print(f"[Search] Incremental update ({label}): "
+              f"{len(new_items)} product(s) merged into index "
+              f"({len(self._items)} total).")
+        return len(new_items)
+
+    def remove_products(self, scoped_product_ids: List[int]) -> int:
+        """
+        Remove products from the in-memory index by their scoped IDs.
+
+        Does NOT trigger a signal re-normalisation — the relative ordering of
+        remaining products stays valid since removing items only changes the
+        absolute max of the corpus, and that effect is minor in practice.
+        Call _renormalize_signals() explicitly after bulk deletions if needed.
+
+        Parameters
+        ----------
+        scoped_product_ids : list of int
+            Same ID space as update_products_incremental().
+
+        Returns
+        -------
+        int — number of products actually removed from the index.
+        """
+        if not scoped_product_ids:
+            return 0
+
+        id_set = set(scoped_product_ids)
+
+        with self._lock:
+            original_count = len(self._items)
+            kept = [
+                (item, raw, norm)
+                for item, raw, norm in zip(
+                    self._items, self._raw_strings, self._normalized_strings
+                )
+                if item["id"] not in id_set
+            ]
+            if kept:
+                self._items, self._raw_strings, self._normalized_strings = (
+                    list(t) for t in zip(*kept)
+                )
+            else:
+                self._items              = []
+                self._raw_strings        = []
+                self._normalized_strings = []
+
+            removed = original_count - len(self._items)
+
+        label = "global" if self.is_global else f"db_id={self.source_db_id}"
+        print(f"[Search] remove_products ({label}): {removed} removed, "
+              f"{len(self._items)} remaining.")
+        return removed
+
     def rebuild(self) -> int:
         """
         Reload products from SQLite and rebuild the in-memory index.
         Also normalises popularity and click_rate signals to 0–100.
         Thread-safe.  Returns number of products indexed.
         """
+        t0 = time.perf_counter()
         items = self._load_products_from_db()
 
         raw_strings        = []
@@ -809,13 +1050,23 @@ class FuzzySearchEngine:
             raw_strings.append(raw)
             normalized_strings.append(normalize(raw))
 
+        now = time.time()
         with self._lock:
             self._items              = items
             self._raw_strings        = raw_strings
             self._normalized_strings = normalized_strings
-            self._last_built         = time.time()
+            self._last_built         = now
 
-        print(f"[Search] Index rebuilt — {len(items)} products loaded.")
+        rebuild_ms = (time.perf_counter() - t0) * 1000.0
+        if _search_metrics:
+            _search_metrics.record_rebuild(rebuild_ms)
+
+        label = "global" if self.is_global else f"db_id={self.source_db_id}"
+        print(f"[Search] Index rebuilt ({label}) — {len(items)} products indexed "
+              f"in {rebuild_ms:.0f}ms.")
+
+        # Persist to disk so the next restart loads instantly from cache.
+        self._save_to_cache(items, raw_strings, normalized_strings, now)
         return len(items)
 
     def _start_background_refresh(self):
@@ -972,9 +1223,18 @@ class FuzzySearchEngine:
                 popularity = f_items[index].get("_popularity", 0.0)
                 click_rate = f_items[index].get("_click_rate", 0.0)
 
+                source_priority = 0.0
+                if self.is_global:
+                    item_db_id = f_items[index].get("source_db_id")
+                    if item_db_id is not None:
+                        source_priority = float(
+                            SEARCH_SOURCE_PRIORITY.get(int(item_db_id), 0.0)
+                        )
+
                 final_score = _composite_score(
                     fuzzy_score, popularity, click_rate,
                     best_fuzzy_in_results=best_fuzzy,
+                    source_priority=source_priority,
                 )
 
                 product_id = f_items[index]["id"]
@@ -1089,3 +1349,34 @@ def get_global_engine(rebuild_interval: Optional[int] = None) -> FuzzySearchEngi
 def rebuild_global_index() -> int:
     """Force rebuild of global engine and return indexed product count."""
     return get_global_engine().rebuild()
+
+
+def get_all_engine_stats() -> Dict:
+    """
+    Return a stats snapshot for every instantiated engine (per-DB and global).
+
+    Acquires _engine_lock once to snapshot the engine registry, then calls
+    stats() on each engine outside the lock to avoid blocking searches.
+
+    Returns
+    -------
+    dict  e.g.::
+        {
+            "db_1":   {"source_db_id": 1, "mode": "isolated", "total_products": 42000, ...},
+            "db_2":   {"source_db_id": 2, "mode": "isolated", "total_products": 18000, ...},
+            "global": {"source_db_id": None, "mode": "global", "total_products": 60000, ...},
+        }
+    Only engines that have been created (via get_engine / get_global_engine) appear.
+    """
+    with _engine_lock:
+        engines_snapshot = dict(_engines)
+        global_snap      = _global_engine
+
+    result: Dict = {}
+    for db_id, engine in engines_snapshot.items():
+        result[f"db_{db_id}"] = engine.stats()
+
+    if global_snap is not None:
+        result["global"] = global_snap.stats()
+
+    return result

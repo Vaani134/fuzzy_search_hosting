@@ -15,6 +15,7 @@ Endpoints
 """
 
 import math
+import time
 from flask import Blueprint, request, jsonify, render_template
 
 from modules.fuzzy_search import (
@@ -23,11 +24,13 @@ from modules.fuzzy_search import (
     rebuild_global_index,
     apply_synonyms,
     get_query_suggestion,
+    get_all_engine_stats,
 )
 from modules.autocomplete import get_suggestions
 from modules.analytics import log_search, get_recent_searches, get_top_queries, \
     get_zero_result_queries, get_trending_queries
 from modules.cache import search_cache
+from modules.metrics import search_metrics
 from config import SEARCH_DEFAULT_K
 from db.database import get_connection
 
@@ -126,23 +129,19 @@ def api_search():
     active_filters = {k: v for k, v in filters.items() if v not in (None, "")}
 
     # ── Cache lookup ──────────────────────────────────────────────────────────
-
-    # cache_key = search_cache.make_key(query, active_filters, page, limit, sort)
-    # cached    = search_cache.get(cache_key)
-    # if cached is not None:
-    #     return jsonify(cached)
-    # ── Cache lookup ──────────────────────────────────────────────────────────
     scoped_filters = {**active_filters, "db_id": "all" if global_mode else db_id}
     cache_key = search_cache.make_key(query, scoped_filters, page, limit, sort)
-
-    #print(f"[DEBUG] Cache key: {cache_key}")
-
+    t0 = time.perf_counter()
     cached = search_cache.get(cache_key)
 
     if cached is not None:
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        search_metrics.record_query_cache_hit()
+        search_metrics.record_search(latency_ms, cached.get("total_results", 0))
         return jsonify(cached)
 
     # ── Execute search ────────────────────────────────────────────────────────
+    search_metrics.record_query_cache_miss()
     engine = get_global_engine() if global_mode else get_engine(source_db_id=db_id)
     expanded_query  = apply_synonyms(query)
 
@@ -209,6 +208,9 @@ def api_search():
         # or too distant from anything known (score < 35).
         "suggestion":     suggestion,
     }
+
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    search_metrics.record_search(latency_ms, total_results)
 
     # Cache the response
     search_cache.set(cache_key, response)
@@ -330,19 +332,21 @@ def api_autocomplete():
     """
     GET /api/autocomplete?q=gla&limit=10
     Returns fast autocomplete suggestions (prefix + contains match).
+    Results are served from the in-memory TTL cache when available.
     """
     query = request.args.get("q", "").strip()
-    if _is_global_mode():
-        suggestions = get_suggestions(query, limit=limit, source_db_id=None)
-        return jsonify(suggestions)
-
-    db_id = _db_id_param()
     limit = min(max(1, _int_param("limit", 10)), 20)
 
     if not query or len(query) < 2:
         return jsonify([])
 
-    suggestions = get_suggestions(query, limit=limit, source_db_id=db_id)
+    source_db_id = None if _is_global_mode() else _db_id_param()
+
+    t0 = time.perf_counter()
+    suggestions = get_suggestions(query, limit=limit, source_db_id=source_db_id)
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    search_metrics.record_autocomplete(latency_ms)
+
     return jsonify(suggestions)
 
 
@@ -363,8 +367,28 @@ def api_rebuild_global():
 
 @search_bp.route("/api/cache/stats")
 def api_cache_stats():
-    """GET /api/cache/stats — current cache statistics."""
-    return jsonify(search_cache.stats())
+    """
+    GET /api/cache/stats — comprehensive cache and performance statistics.
+
+    Response shape:
+        query_cache  — SearchCache (Redis/in-memory) hit rate and size
+        disk_cache   — per-slot engine.pkl.gz validity, age, and size
+        engines      — in-memory index stats per instantiated engine
+        metrics      — latency percentiles, cache hit rates, rebuild counters
+    """
+    disk_stats: dict = {}
+    try:
+        from modules.cache_manager import get_all_stats
+        disk_stats = get_all_stats()
+    except Exception:
+        pass
+
+    return jsonify({
+        "query_cache": search_cache.stats(),
+        "disk_cache":  disk_stats,
+        "engines":     get_all_engine_stats(),
+        "metrics":     search_metrics.snapshot(),
+    })
 
 
 # ── POST /api/cache/clear ──────────────────────────────────────────────────────

@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /d \"d:\\\\Fuzzy_search_hosting\")",
+      "Bash(python -m py_compile config.py)",
+      "Bash(python -m py_compile modules/cache_manager.py)",
+      "Bash(python -m py_compile modules/fuzzy_search.py)",
+      "Bash(python -m py_compile \"d:/Fuzzy_search_hosting/modules/fuzzy_search.py\")",
+      "Bash(python -m py_compile \"d:/Fuzzy_search_hosting/config.py\")",
+      "Bash(python -m py_compile \"d:/Fuzzy_search_hosting/modules/autocomplete.py\")",
+      "Bash(python -m py_compile \"d:/Fuzzy_search_hosting/modules/sync_manager.py\")",
+      "Bash(python -m py_compile \"d:/Fuzzy_search_hosting/routes/search_routes.py\")"
+    ]
+  }
+}

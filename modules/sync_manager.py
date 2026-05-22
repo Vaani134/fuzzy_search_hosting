@@ -1034,16 +1034,19 @@ def sync_database_background(
 # ── Index rebuild trigger ──────────────────────────────────────────────────────
 
 def _trigger_index_rebuild(db_id: int) -> None:
-    """Rebuild in-memory search engines (isolated + global) and clear cache."""
+    """Rebuild in-memory search engines (isolated + global) and clear all caches."""
     try:
         from modules.fuzzy_search import get_engine, rebuild_global_index
         from modules.cache import search_cache
+        from modules.autocomplete import invalidate_autocomplete_cache
         engine = get_engine(source_db_id=db_id)
         engine.rebuild()
         rebuild_global_index()
         search_cache.clear()
+        invalidate_autocomplete_cache()
         print(
-            f"[sync_manager] Search indexes rebuilt for db_id={db_id} and global; cache cleared."
+            f"[sync_manager] Search indexes rebuilt for db_id={db_id} and global; "
+            f"query cache and autocomplete cache cleared."
         )
     except Exception as exc:
         print(f"[sync_manager] Index rebuild warning: {exc}")

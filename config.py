@@ -92,3 +92,34 @@ PORT = int(os.getenv("FLASK_PORT", "5000"))
 # Example: redis://user:password@localhost:6379/0
 REDIS_URL = os.getenv("REDIS_URL", "")
 REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "fzsearch:")
+
+# ── Engine disk cache (persistent index cache) ─────────────────────────────────
+# Persists the fuzzy-search engine's in-memory product index to disk so that
+# application restarts load instantly from cache instead of rebuilding from
+# SQLite from scratch.  Set CACHE_ENABLED=false to disable entirely.
+CACHE_ENABLED     = os.getenv("CACHE_ENABLED", "true").lower() in ("1", "true", "yes")
+CACHE_DIR         = os.getenv("CACHE_DIR") or os.path.join(BASE_DIR, "cache")
+CACHE_COMPRESSION = os.getenv("CACHE_COMPRESSION", "true").lower() in ("1", "true", "yes")
+# Increment CACHE_VERSION to force invalidation of all cached engine indexes.
+CACHE_VERSION     = os.getenv("CACHE_VERSION", "1")
+# Maximum cache age in seconds before it is considered stale.  0 = no age limit.
+CACHE_MAX_AGE     = int(os.getenv("CACHE_MAX_AGE", str(86400 * 7)))   # 7 days default
+# Clean up orphaned .tmp files and empty cache directories on startup.
+AUTO_CLEANUP      = os.getenv("AUTO_CLEANUP", "true").lower() in ("1", "true", "yes")
+
+# ── Metrics ────────────────────────────────────────────────────────────────────
+# Number of recent latency samples retained in each rolling percentile window.
+METRICS_LATENCY_WINDOW = int(os.getenv("METRICS_LATENCY_WINDOW", "1000"))
+
+# ── Source priority ────────────────────────────────────────────────────────────
+# Optional per-database priority boost applied to global search scoring.
+# Map source_db_id (int) → priority float.  Higher = ranked earlier.
+# Example: {1: 5.0, 2: 0.0}  boosts DB-1 results by 5 points in global ranking.
+# Override at runtime by setting SEARCH_SOURCE_PRIORITY as JSON:
+#   export SEARCH_SOURCE_PRIORITY='{"1": 5.0}'
+import json as _json
+_raw_priority = os.getenv("SEARCH_SOURCE_PRIORITY", "{}")
+try:
+    SEARCH_SOURCE_PRIORITY: dict = {int(k): float(v) for k, v in _json.loads(_raw_priority).items()}
+except Exception:
+    SEARCH_SOURCE_PRIORITY: dict = {}

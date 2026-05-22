@@ -15,3 +15,6 @@ __pycache__/
 
 # Environment
 .env
+
+# Engine disk cache (rebuilt automatically — never commit)
+cache/
