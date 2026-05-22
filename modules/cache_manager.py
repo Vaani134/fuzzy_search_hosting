@@ -322,6 +322,8 @@ class CacheManager:
           2. Compute SHA-256 of the temp file.
           3. Atomically rename temp → final with ``os.replace()``.
           4. Write metadata.json the same way.
+          5. If MAX_DISK_CACHE_MB is set, enforce the total disk limit by
+             removing the oldest slot(s) until total size is within the limit.
 
         Returns True on success, False on any error (non-fatal).
         """
@@ -374,6 +376,18 @@ class CacheManager:
                     f"[Cache] SAVE {self.slot_key}: {n} items, "
                     f"{size_mb:.1f} MB written in {elapsed:.3f}s"
                 )
+
+                # ── Step 5: enforce disk size limit (outside the per-slot lock) ─
+                # Done here so all callers benefit automatically; failures are
+                # non-fatal and never affect the save result.
+                try:
+                    from config import MAX_DISK_CACHE_MB
+                    if MAX_DISK_CACHE_MB > 0:
+                        _root = os.path.dirname(self.cache_dir)
+                        enforce_disk_cache_limit(_root, MAX_DISK_CACHE_MB * 1024 * 1024)
+                except Exception as _exc:
+                    logger.debug("[Cache] Disk limit check skipped: %s", _exc)
+
                 return True
 
             except Exception as exc:
@@ -451,6 +465,103 @@ class CacheManager:
                 "compression":   meta.get("compression"),
             })
         return stat
+
+
+# ── Disk cache size enforcement ───────────────────────────────────────────────
+
+def enforce_disk_cache_limit(cache_dir: str, max_bytes: int) -> int:
+    """
+    Ensure the total size of all engine files under *cache_dir* does not
+    exceed *max_bytes*.  When the limit is exceeded, the oldest slot(s) are
+    removed (all files in the slot subdirectory) until total size is within
+    the limit.
+
+    Called automatically by ``CacheManager.save_engine_data()`` after every
+    successful write when ``MAX_DISK_CACHE_MB`` is configured.
+
+    Parameters
+    ----------
+    cache_dir : str
+        Root cache directory (e.g. ``/app/cache``).
+    max_bytes : int
+        Maximum allowed total size in bytes.  0 = no limit (no-op).
+
+    Returns
+    -------
+    int — number of slot directories removed.
+    """
+    if max_bytes <= 0 or not os.path.isdir(cache_dir):
+        return 0
+
+    # Collect (built_at_ts, slot_dir, total_size_bytes) for each slot.
+    slots: list = []
+    try:
+        for entry in os.scandir(cache_dir):
+            if not entry.is_dir():
+                continue
+            slot_size = 0
+            built_at_ts = 0.0
+            for fname in ("engine.pkl.gz", "engine.pkl"):
+                engine_file = os.path.join(entry.path, fname)
+                if os.path.isfile(engine_file):
+                    slot_size += os.path.getsize(engine_file)
+                    break
+            meta_file = os.path.join(entry.path, "metadata.json")
+            if os.path.isfile(meta_file):
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                    ts_str = meta.get("built_at", "")
+                    if ts_str:
+                        built_at_ts = datetime.fromisoformat(
+                            ts_str.replace("Z", "+00:00")
+                        ).timestamp()
+                    slot_size += os.path.getsize(meta_file)
+                except Exception:
+                    pass
+            if slot_size > 0:
+                slots.append((built_at_ts, entry.path, slot_size))
+    except Exception as exc:
+        logger.warning("[Cache] Disk limit scan error: %s", exc)
+        return 0
+
+    total_bytes = sum(s[2] for s in slots)
+    if total_bytes <= max_bytes:
+        return 0
+
+    # Remove oldest slots first until total is within the limit.
+    slots.sort(key=lambda s: s[0])   # ascending built_at → oldest first
+    removed = 0
+    for built_at_ts, slot_dir, slot_size in slots:
+        if total_bytes <= max_bytes:
+            break
+        slot_name = os.path.basename(slot_dir)
+        # Acquire the per-slot lock if it exists so we don't race with a save.
+        slot_lock = _get_slot_lock(slot_name)
+        try:
+            with slot_lock:
+                for fname in os.listdir(slot_dir):
+                    fpath = os.path.join(slot_dir, fname)
+                    if os.path.isfile(fpath):
+                        try:
+                            os.unlink(fpath)
+                        except Exception as exc:
+                            logger.debug("[Cache] Could not remove %s: %s", fpath, exc)
+            total_bytes -= slot_size
+            removed     += 1
+            logger.info(
+                "[Cache] Disk limit: removed slot %s (%.1f MB, total now %.1f MB / %.1f MB)",
+                slot_name, slot_size / (1024 * 1024),
+                total_bytes / (1024 * 1024), max_bytes / (1024 * 1024),
+            )
+            print(
+                f"[Cache] Disk limit: removed old slot '{slot_name}' "
+                f"({slot_size/1024/1024:.1f} MB)."
+            )
+        except Exception as exc:
+            logger.warning("[Cache] Could not remove slot %s: %s", slot_dir, exc)
+
+    return removed
 
 
 # ── Module-level manager registry ─────────────────────────────────────────────

@@ -111,6 +111,23 @@ AUTO_CLEANUP      = os.getenv("AUTO_CLEANUP", "true").lower() in ("1", "true", "
 # Number of recent latency samples retained in each rolling percentile window.
 METRICS_LATENCY_WINDOW = int(os.getenv("METRICS_LATENCY_WINDOW", "1000"))
 
+# ── Periodic compaction rebuild ────────────────────────────────────────────────
+# After this many incremental index updates, a full rebuild() is triggered in
+# a background thread to reclaim memory fragmentation.  0 = disabled.
+FULL_REBUILD_AFTER_N_INCREMENTALS = int(os.getenv("FULL_REBUILD_AFTER_N_INCREMENTALS", "500"))
+
+# ── Hard cache limits ──────────────────────────────────────────────────────────
+# Maximum number of entries in the in-memory query result cache (LRU eviction).
+MAX_QUERY_CACHE_ENTRIES = int(os.getenv("MAX_QUERY_CACHE_ENTRIES", "1000"))
+
+# Maximum number of entries in the in-memory autocomplete cache (LRU eviction).
+MAX_AUTOCOMPLETE_CACHE_ENTRIES = int(os.getenv("MAX_AUTOCOMPLETE_CACHE_ENTRIES", "500"))
+
+# Maximum total size of all on-disk engine cache files in megabytes.
+# When exceeded after a save, the oldest slot(s) are removed until under limit.
+# 0 = no disk cache size limit.
+MAX_DISK_CACHE_MB = int(os.getenv("MAX_DISK_CACHE_MB", "500"))
+
 # ── Source priority ────────────────────────────────────────────────────────────
 # Optional per-database priority boost applied to global search scoring.
 # Map source_db_id (int) → priority float.  Higher = ranked earlier.

@@ -400,7 +400,12 @@ class SearchCache:
 
 # ── Module-level singleton ─────────────────────────────────────────────────────
 # Shared across the entire Flask app.
-# TTL = 60 s, max 500 entries (in-memory mode).
-# Redis TTL is set per-key via SETEX.
-search_cache = SearchCache(ttl=60, max_size=500)
+# TTL = 60 s; max entries controlled by MAX_QUERY_CACHE_ENTRIES (default 1000).
+# Redis TTL is set per-key via SETEX; max_size only applies to the in-memory backend.
+try:
+    from config import MAX_QUERY_CACHE_ENTRIES as _MAX_QC
+except (ImportError, AttributeError):
+    _MAX_QC = 1000
+
+search_cache = SearchCache(ttl=60, max_size=_MAX_QC)
 search_cache.start_cleanup_thread(interval=120)

@@ -175,11 +175,65 @@ engine.update_products_incremental([scoped_id_1, scoped_id_2])  # fetch + merge
 engine.remove_products([scoped_id_3])                            # drop from index
 ```
 
-After `update_products_incremental`, popularity and click signals are re-normalised across the entire in-memory corpus using `_renormalize_signals()` — no DB query needed.
+After `update_products_incremental`, popularity and click signals are re-normalised across the entire in-memory corpus — no DB query needed.
+
+### Incremental update lifecycle (7 steps)
+
+1. **Fetch outside lock** — new product dicts loaded from SQLite (I/O outside critical section).
+2. **CoW snapshot** — shallow copy of `_items`, `_raw_strings`, `_normalized_strings` lists.
+3. **Merge into copies** — existing IDs updated in-place within the copy; new IDs appended.
+4. **Re-normalise signals** — popularity and click-rate min-max normalised across the merged corpus.
+5. **Atomic swap** — `self._items = merged_items` (and the other two lists) under the lock; all three references updated together.
+6. **Compaction counter** — increments `_incremental_update_count`; when it reaches `FULL_REBUILD_AFTER_N_INCREMENTALS`, the counter resets and a compaction is scheduled.
+7. **Background compaction** — `_compaction_rebuild()` runs in a daemon thread: calls `rebuild()` which builds a fresh index from SQLite, then atomically swaps it in and resets the counter.
+
+### Periodic compaction rebuild
+
+After `N` incremental updates the engine spawns a background `_compaction_rebuild()` thread that performs a full `rebuild()`. This reclaims memory fragmentation from accumulated incremental merges without blocking search.
+
+```bash
+export FULL_REBUILD_AFTER_N_INCREMENTALS=500   # 0 = disable compaction
+```
+
+The compaction counter and threshold are visible in `GET /api/cache/stats` under `engines`:
+```json
+"db_1": {
+  "mode": "isolated",
+  "total_products": 42000,
+  "incremental_update_count": 127,
+  "compaction_threshold": 500
+}
+```
 
 ---
 
-## 7. Metrics & Observability
+## 7. Copy-on-Write Concurrency Model
+
+The in-memory index (`_items`, `_raw_strings`, `_normalized_strings`) uses a **copy-on-write (CoW)** strategy:
+
+- **Writers** (incremental update, remove, compaction rebuild) create **new list objects**, populate them, then atomically swap the reference under `_lock`.
+- **Readers** (search threads) acquire `_lock` only to read the current list references, then immediately release it and hold their own snapshot — searching against an immutable list that will never be mutated under them.
+- This makes search **effectively lock-free** after the initial snapshot acquisition: concurrent writes never block concurrent reads.
+
+```
+writer thread:                   reader thread:
+─────────────────────────────    ──────────────────────────────────
+merged = list(self._items)       with self._lock:
+# ... populate merged ...            items = self._items   ← snapshot
+with self._lock:                 # lock released
+    self._items = merged         for item in items:        ← safe, immutable view
+                                     score(item, query)
+```
+
+### Signal writes on shared dicts
+Unchanged product dicts may be referenced by both the old and new list snapshots. Signal fields (`_popularity`, `_click_rate`) are updated as atomic dict `__setitem__` operations (CPython GIL). Concurrent reads see either the old or new float — never a torn value.
+
+### Lock type
+`FuzzySearchEngine._lock` is a `threading.RLock` (re-entrant). This allows `rebuild()` (which acquires the lock for the final swap) to be called from within `_compaction_rebuild()` without deadlocking, even if the same thread previously acquired the lock.
+
+---
+
+## 8. Metrics & Observability
 
 `GET /api/cache/stats` returns a comprehensive JSON snapshot:
 
@@ -194,8 +248,14 @@ After `update_products_incremental`, popularity and click signals are re-normali
     "db_2":   {"cached": true, "product_count": 18000, "built_at": "...", "size_bytes": 3800000}
   },
   "engines": {
-    "db_1":   {"mode": "isolated", "total_products": 42000, "last_built": 1716400000.0},
-    "global": {"mode": "global",   "total_products": 60000, "last_built": 1716400001.2}
+    "db_1":   {
+      "mode": "isolated", "total_products": 42000, "last_built": 1716400000.0,
+      "incremental_update_count": 127, "compaction_threshold": 500
+    },
+    "global": {
+      "mode": "global", "total_products": 60000, "last_built": 1716400001.2,
+      "incremental_update_count": 0, "compaction_threshold": 500
+    }
   },
   "metrics": {
     "uptime_seconds": 3600.0,
@@ -228,7 +288,7 @@ After `update_products_incremental`, popularity and click signals are re-normali
 
 ---
 
-## 8. Sync Lifecycle
+## 9. Sync Lifecycle
 
 ```
 POST /api/database/<id>/sync
@@ -255,7 +315,7 @@ Steps 6–9 only run on a **successful** sync. Partial, stopped, or failed syncs
 
 ---
 
-## 9. Cold-Start Sequence
+## 10. Cold-Start Sequence
 
 ```
 app.py starts
@@ -293,7 +353,7 @@ app.py starts
 
 ---
 
-## 10. Configuration Reference
+## 11. Configuration Reference
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -311,6 +371,10 @@ app.py starts
 | `SEARCH_DEFAULT_K` | `20` | Default result count |
 | `SEARCH_MAX_K` | `100` | Hard cap on result count |
 | `SYNC_BATCH_SIZE` | `2000` | Rows per MySQL fetch batch during sync |
+| `FULL_REBUILD_AFTER_N_INCREMENTALS` | `500` | Trigger background compaction rebuild after N incremental updates; `0` = disabled |
+| `MAX_QUERY_CACHE_ENTRIES` | `1000` | Max entries in the in-memory query result cache (LRU eviction) |
+| `MAX_AUTOCOMPLETE_CACHE_ENTRIES` | `500` | Max entries in the in-memory autocomplete cache (LRU eviction) |
+| `MAX_DISK_CACHE_MB` | `500` | Max total size of disk cache in MB; oldest slots removed when exceeded; `0` = no limit |
 
 ### SEARCH_SOURCE_PRIORITY example
 ```bash
@@ -320,7 +384,7 @@ This boosts DB-1 results by 5 points in global search scoring. Only applied in g
 
 ---
 
-## 11. API Reference
+## 12. API Reference
 
 ### Search
 | Method | Endpoint | Description |
@@ -351,7 +415,7 @@ This boosts DB-1 results by 5 points in global search scoring. Only applied in g
 
 ---
 
-## 12. Production Deployment
+## 13. Production Deployment
 
 ### Requirements
 ```
@@ -371,19 +435,30 @@ export AUTO_CLEANUP=true
 ```
 
 ### Thread safety
-- `FuzzySearchEngine._lock` is a `threading.RLock` — re-entrant safe for nested calls.
-- `CacheManager` uses per-slot `threading.Lock` — concurrent read/write to the same slot is serialized.
+- `FuzzySearchEngine._lock` is a `threading.RLock` — re-entrant safe; allows `rebuild()` to be called from `_compaction_rebuild()` without deadlock.
+- Index reads use CoW snapshots — threads hold their own list reference and release the lock before searching, so writes never block reads.
+- `CacheManager` uses per-slot `threading.Lock` — concurrent read/write to the same slot is serialised.
 - `SearchMetrics` uses a single `threading.Lock` — all counter increments are O(1).
 - `autocomplete._cache_lock` is a `threading.Lock` — OrderedDict mutations are atomic.
+
+### Memory management
+| Layer | Bound mechanism |
+|-------|----------------|
+| Query result cache | `MAX_QUERY_CACHE_ENTRIES` — LRU eviction (oldest-timestamp entry dropped) |
+| Autocomplete cache | `MAX_AUTOCOMPLETE_CACHE_ENTRIES` — LRU eviction (front of OrderedDict popped) |
+| Disk cache | `MAX_DISK_CACHE_MB` — oldest-slot removal after each successful save |
+| Latency windows | `METRICS_LATENCY_WINDOW` — fixed-size `deque(maxlen=N)`, O(1) append/pop |
+| In-memory index | Bounded by product count in SQLite; CoW briefly doubles peak RSS during merge |
 
 ### Scaling notes
 - All caches are **process-local**. Multi-worker deployments (gunicorn) require Redis (`REDIS_URL`) for the query cache; the disk cache and autocomplete cache are per-process but idempotent.
 - The disk cache is write-safe across concurrent startups because of atomic `os.replace()` writes.
 - Set `METRICS_LATENCY_WINDOW` lower (e.g. `200`) on memory-constrained deployments.
+- Compaction rebuilds run in daemon threads — they do not block request handling but will briefly double RSS during the build. Tune `FULL_REBUILD_AFTER_N_INCREMENTALS` to balance memory fragmentation vs. rebuild cost.
 
 ---
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
@@ -393,3 +468,7 @@ export AUTO_CLEANUP=true
 | `GET /api/cache/stats` shows 0 latency samples | No searches run yet | Normal — percentiles populate after first queries |
 | `disk_cache_miss` counter rising | Cache corrupted / schema changed | Bump `CACHE_VERSION` to invalidate all slots |
 | `.tmp` files accumulating | Server crashed during cache write | Set `AUTO_CLEANUP=true` and restart |
+| Memory grows steadily after many syncs | Index fragmentation from incremental merges | Lower `FULL_REBUILD_AFTER_N_INCREMENTALS` to trigger compaction sooner |
+| Disk cache directory growing unbounded | `MAX_DISK_CACHE_MB` not set | Set `MAX_DISK_CACHE_MB=500` (or any limit); oldest slots removed automatically |
+| Query cache growing too large | Default `MAX_QUERY_CACHE_ENTRIES=1000` too high | Reduce via env var; in-memory LRU evicts automatically but peak RSS depends on result payload size |
+| Compaction rebuild running too frequently | `FULL_REBUILD_AFTER_N_INCREMENTALS` too low | Increase the threshold; each compaction briefly doubles index RSS |

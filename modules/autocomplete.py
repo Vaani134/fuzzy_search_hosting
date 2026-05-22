@@ -38,7 +38,12 @@ from db.database import get_connection
 _cache: OrderedDict = OrderedDict()   # key → (results_list, expiry_monotonic)
 _cache_lock = threading.Lock()
 _CACHE_TTL: float = 30.0   # cache entry lifetime in seconds
-_CACHE_MAX: int   = 500    # max cached query tuples (LRU eviction beyond this)
+
+# Max entries — read from config so it can be tuned without code changes.
+try:
+    from config import MAX_AUTOCOMPLETE_CACHE_ENTRIES as _CACHE_MAX
+except (ImportError, AttributeError):
+    _CACHE_MAX = 500
 
 
 def _cache_get(key: tuple) -> Optional[List[Dict]]:

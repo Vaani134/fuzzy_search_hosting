@@ -45,7 +45,10 @@ import os
 from typing import List, Dict, Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import SEARCH_MIN_SCORE, SEARCH_DEFAULT_K, SEARCH_MAX_K, SEARCH_SOURCE_PRIORITY
+from config import (
+    SEARCH_MIN_SCORE, SEARCH_DEFAULT_K, SEARCH_MAX_K,
+    SEARCH_SOURCE_PRIORITY, FULL_REBUILD_AFTER_N_INCREMENTALS,
+)
 from db.database import get_connection
 
 try:
@@ -688,8 +691,15 @@ class FuzzySearchEngine:
         self._items:              List[Dict[str, Any]] = []
         self._raw_strings:        List[str] = []
         self._normalized_strings: List[str] = []
+        # RLock allows re-entrant acquisition (e.g. _renormalize_signals called
+        # from update_products_incremental which already holds the lock).
         self._lock                = threading.RLock()
         self._last_built:         Optional[float] = None
+
+        # Counts incremental updates since the last full rebuild.
+        # When it reaches FULL_REBUILD_AFTER_N_INCREMENTALS, a compaction
+        # rebuild is triggered in a background thread.
+        self._incremental_update_count: int = 0
 
         # Build index on startup — try disk cache first for instant startup.
         # Falls back to a full SQLite rebuild if the cache is missing/stale/corrupt.
@@ -895,40 +905,65 @@ class FuzzySearchEngine:
         Re-run min-max normalization on all in-memory items using the stored
         raw signal values (popularity_raw, click_count_raw).
 
-        Called after update_products_incremental() merges new data into the
-        index so that the normalised _popularity and _click_rate values stay
-        consistent with the full corpus — no DB query required.
+        Copy-on-write safe: creates a new list reference so that any search
+        thread that already holds a snapshot of the old list is unaffected.
+        Signal values (_popularity, _click_rate) are written atomically via
+        CPython's GIL-guaranteed dict __setitem__, so a concurrent reader
+        sees either the old or new float — never a torn write.
 
-        Thread-safe: acquires self._lock (RLock, so re-entrant if needed).
+        Thread-safe: acquires self._lock (RLock, re-entrant safe).
         """
         with self._lock:
             if not self._items:
                 return
-            pop_raw   = [float(item.get("popularity_raw",  0) or 0) for item in self._items]
-            click_raw = [float(item.get("click_count_raw", 0) or 0) for item in self._items]
+            # CoW: work on a shallow copy so the live reference is replaced
+            # atomically at the end rather than mutated in-place.
+            snapshot = list(self._items)
+            pop_raw   = [float(item.get("popularity_raw",  0) or 0) for item in snapshot]
+            click_raw = [float(item.get("click_count_raw", 0) or 0) for item in snapshot]
             pop_norm   = self._normalise_signal(pop_raw)
             click_norm = self._normalise_signal(click_raw)
-            for i, item in enumerate(self._items):
+            for i, item in enumerate(snapshot):
                 item["_popularity"] = pop_norm[i]
                 item["_click_rate"] = click_norm[i]
+            # Atomic reference swap — searches that already grabbed the old list
+            # reference continue safely; new searches get this updated list.
+            self._items = snapshot
 
     def update_products_incremental(self, scoped_product_ids: List[int]) -> int:
         """
         Fetch fresh data for the given product IDs and merge into the index.
 
         This avoids a full SQLite table scan when only a small subset of
-        products was inserted or updated during an incremental sync.  Existing
-        entries are replaced in-place; new IDs are appended.
+        products was inserted or updated during an incremental sync.
 
-        After merging, popularity and click signals are re-normalised across the
-        entire in-memory corpus so relative ordering remains correct.
+        Concurrency model — copy-on-write (CoW)
+        ----------------------------------------
+        The entire merge-normalise-swap sequence runs under a single lock
+        acquisition.  This means:
+
+        1. A new list is built from the current state (shallow copy).
+        2. New/updated items are merged into the copy.
+        3. Signals are re-normalised across the full merged corpus.
+        4. ``self._items / _raw_strings / _normalized_strings`` are atomically
+           replaced with the new lists.
+
+        Any search thread that grabbed a snapshot of the old lists BEFORE the
+        lock was acquired will continue running safely — it holds references to
+        the old, now-immutable list objects.  No structural mutation (append /
+        element replace) is ever performed on a live snapshot.
+
+        Periodic compaction
+        -------------------
+        After every FULL_REBUILD_AFTER_N_INCREMENTALS (default 500) calls, a
+        full ``rebuild()`` is triggered in a background thread to reclaim any
+        memory fragmentation caused by repeated partial updates.
 
         Parameters
         ----------
         scoped_product_ids : list of int
-            The ``p.id`` values as stored in SQLite (already scoped with
-            source_db_id × _ID_SCOPE_MULTIPLIER for global engine rows, or the
-            original product IDs for per-DB engine rows).
+            The ``p.id`` values as stored in SQLite (scoped IDs for global
+            engine; original IDs for per-DB engine).
 
         Returns
         -------
@@ -937,6 +972,7 @@ class FuzzySearchEngine:
         if not scoped_product_ids:
             return 0
 
+        # ── Step 1: fetch from DB (outside the lock — expensive I/O) ──────────
         new_items = self._load_products_from_db(product_ids=scoped_product_ids)
         if not new_items:
             return 0
@@ -949,28 +985,89 @@ class FuzzySearchEngine:
             new_raw_strs.append(raw)
             new_norm_strs.append(normalize(raw))
 
+        needs_compaction = False
+
         with self._lock:
-            id_to_idx = {item["id"]: i for i, item in enumerate(self._items)}
+            # ── Step 2: CoW — build new lists from current state ───────────────
+            # Searches that already hold references to the current lists are
+            # unaffected; they see an immutable snapshot of the pre-update state.
+            merged_items = list(self._items)
+            merged_raw   = list(self._raw_strings)
+            merged_norm  = list(self._normalized_strings)
+
+            # ── Step 3: merge new/updated items into the copies ────────────────
+            id_to_idx = {item["id"]: i for i, item in enumerate(merged_items)}
 
             for i, item in enumerate(new_items):
                 pid = item["id"]
                 if pid in id_to_idx:
-                    idx = id_to_idx[pid]
-                    self._items[idx]              = item
-                    self._raw_strings[idx]        = new_raw_strs[i]
-                    self._normalized_strings[idx] = new_norm_strs[i]
+                    merged_items[id_to_idx[pid]] = item
+                    merged_raw  [id_to_idx[pid]] = new_raw_strs[i]
+                    merged_norm [id_to_idx[pid]] = new_norm_strs[i]
                 else:
-                    self._items.append(item)
-                    self._raw_strings.append(new_raw_strs[i])
-                    self._normalized_strings.append(new_norm_strs[i])
+                    merged_items.append(item)
+                    merged_raw.append(new_raw_strs[i])
+                    merged_norm.append(new_norm_strs[i])
 
-        self._renormalize_signals()
+            # ── Step 4: re-normalise signals on the full merged corpus ─────────
+            # New items are fresh dicts from SQLite — safe to mutate.
+            # Unchanged items share dict objects with the old snapshot; signal
+            # assignments are atomic float writes (CPython GIL guarantee), so
+            # a concurrent search sees either the old or new value — never torn.
+            pop_raw   = [float(it.get("popularity_raw",  0) or 0) for it in merged_items]
+            click_raw = [float(it.get("click_count_raw", 0) or 0) for it in merged_items]
+            pop_norm   = self._normalise_signal(pop_raw)
+            click_norm = self._normalise_signal(click_raw)
+            for i, it in enumerate(merged_items):
+                it["_popularity"] = pop_norm[i]
+                it["_click_rate"] = click_norm[i]
+
+            # ── Step 5: atomic CoW swap ────────────────────────────────────────
+            # Searches started AFTER this assignment use the new lists.
+            # Searches started BEFORE use the old (now unreferenced) lists.
+            self._items              = merged_items
+            self._raw_strings        = merged_raw
+            self._normalized_strings = merged_norm
+
+            # ── Step 6: compaction counter ────────────────────────────────────
+            self._incremental_update_count += 1
+            threshold = FULL_REBUILD_AFTER_N_INCREMENTALS
+            if threshold > 0 and self._incremental_update_count >= threshold:
+                self._incremental_update_count = 0   # reset BEFORE async trigger
+                needs_compaction = True
+
+        # ── Step 7: schedule compaction outside the lock ──────────────────────
+        if needs_compaction:
+            threading.Thread(
+                target=self._compaction_rebuild,
+                daemon=True,
+                name=f"compaction-{self.slot_key if hasattr(self, 'slot_key') else 'engine'}",
+            ).start()
 
         label = "global" if self.is_global else f"db_id={self.source_db_id}"
         print(f"[Search] Incremental update ({label}): "
-              f"{len(new_items)} product(s) merged into index "
-              f"({len(self._items)} total).")
+              f"{len(new_items)} product(s) merged "
+              f"({len(self._items)} total"
+              + (", compaction scheduled" if needs_compaction else "") + ").")
         return len(new_items)
+
+    def _compaction_rebuild(self) -> None:
+        """
+        Full rebuild triggered by the compaction threshold.
+
+        Runs in a background daemon thread so it never blocks the caller.
+        If the rebuild raises, the existing index continues serving queries —
+        the failure is printed and the compaction counter stays at 0 so the
+        next N incrementals will trigger another attempt.
+        """
+        label = "global" if self.is_global else f"db_id={self.source_db_id}"
+        print(f"[Search] Compaction rebuild starting ({label}) — "
+              f"threshold={FULL_REBUILD_AFTER_N_INCREMENTALS} incrementals reached.")
+        try:
+            self.rebuild()
+            print(f"[Search] Compaction rebuild complete ({label}).")
+        except Exception as exc:
+            print(f"[Search] Compaction rebuild failed ({label}): {exc}")
 
     def remove_products(self, scoped_product_ids: List[int]) -> int:
         """
@@ -1024,6 +1121,17 @@ class FuzzySearchEngine:
         """
         Reload products from SQLite and rebuild the in-memory index.
         Also normalises popularity and click_rate signals to 0–100.
+
+        Safe engine swap (Phase 5)
+        --------------------------
+        All expensive work (SQLite query, string building, normalisation) runs
+        OUTSIDE the lock so searches are never blocked during the rebuild.
+
+        Only the final atomic reference swap runs under the lock.  These are
+        simple Python assignments that cannot raise, so the old index is
+        guaranteed to remain active if any earlier step fails — the exception
+        propagates before the lock is acquired.
+
         Thread-safe.  Returns number of products indexed.
         """
         t0 = time.perf_counter()
@@ -1051,11 +1159,15 @@ class FuzzySearchEngine:
             normalized_strings.append(normalize(raw))
 
         now = time.time()
+        # Atomic CoW swap: all expensive work is done; just update references.
+        # Simple assignments cannot raise, so old state is preserved on any
+        # earlier exception. Compaction counter reset here too.
         with self._lock:
-            self._items              = items
-            self._raw_strings        = raw_strings
-            self._normalized_strings = normalized_strings
-            self._last_built         = now
+            self._items                    = items
+            self._raw_strings              = raw_strings
+            self._normalized_strings       = normalized_strings
+            self._last_built               = now
+            self._incremental_update_count = 0   # full rebuild resets compaction clock
 
         rebuild_ms = (time.perf_counter() - t0) * 1000.0
         if _search_metrics:
@@ -1295,15 +1407,22 @@ class FuzzySearchEngine:
             return "low"
         return "none"
 
+    @property
+    def slot_key(self) -> str:
+        """Unique string key for this engine slot (used in log messages)."""
+        return "global" if self.is_global else f"db_{self.source_db_id}"
+
     def stats(self) -> dict:
         with self._lock:
             return {
-                "source_db_id":  self.source_db_id,
-                "mode":          "global" if self.is_global else "isolated",
-                "total_products": len(self._items),
-                "last_built":     self._last_built,
-                "min_score":      self.min_score,
-                "text_fields":    self.text_fields,
+                "source_db_id":             self.source_db_id,
+                "mode":                     "global" if self.is_global else "isolated",
+                "total_products":           len(self._items),
+                "last_built":               self._last_built,
+                "min_score":                self.min_score,
+                "text_fields":              self.text_fields,
+                "incremental_update_count": self._incremental_update_count,
+                "compaction_threshold":     FULL_REBUILD_AFTER_N_INCREMENTALS,
             }
 
 

@@ -259,5 +259,9 @@ class SearchMetrics:
 #
 # Imported by fuzzy_search.py, search_routes.py, and potentially other modules.
 # All recording calls are O(1) and never raise; latency tracking is
-# bounded-memory via deque(maxlen=1000).
-search_metrics = SearchMetrics(latency_window=1000)
+# bounded-memory via deque(maxlen=METRICS_LATENCY_WINDOW).
+try:
+    from config import METRICS_LATENCY_WINDOW as _MLW
+except (ImportError, AttributeError):
+    _MLW = 1000
+search_metrics = SearchMetrics(latency_window=_MLW)
