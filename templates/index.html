@@ -331,7 +331,7 @@
 <div class="row row-cols-1 row-cols-sm-2 row-cols-md-3 row-cols-xl-4 g-4">
   {% for p in results %}
   <div class="col">
-    {% set img = (p.main_image or p.image) | img_url %}
+    {% set img = (p.main_image or p.image) | img_url(p.source_db_id) %}
     <div class="card product-card h-100 shadow-sm position-relative"
          id="card-{{ p.id }}">
 
@@ -416,7 +416,7 @@
             </span>
           </div>
           <div class="score-bar-track">
-            <div class="score-bar-fill {{ p.score_label }}" style="width: {{ p.score_pct }}%;"></div>
+            <div class="score-bar-fill {{ p.score_label }}" data-pct="{{ p.score_pct }}"></div>
           </div>
 
           <!-- Field scores (collapsible) -->
@@ -521,7 +521,10 @@
 
   // ── Highlight query terms in product names ─────────────────────────────────
   document.addEventListener("DOMContentLoaded", () => {
-    const query = {{ query | tojson }};
+    document.querySelectorAll(".score-bar-fill[data-pct]").forEach(function(el) {
+      el.style.width = el.getAttribute("data-pct") + "%";
+    });
+    const query = (document.getElementById("searchInput") || { value: "" }).value || "";
     if (!query) return;
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
 
@@ -588,7 +591,7 @@
     const detectedLabel = document.getElementById("img-detected-label");
     const btnClear    = document.getElementById("btn-clear-image");
     const searchInput = document.getElementById("searchInput");
-    const currentDbId = {{ db_id | int }};
+    const currentDbId = "{{ db_id }}";
 
     if (!btnImg) return;
 

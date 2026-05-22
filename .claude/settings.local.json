@@ -10,7 +10,8 @@
       "Bash(python -m py_compile \"d:/Fuzzy_search_hosting/modules/autocomplete.py\")",
       "Bash(python -m py_compile \"d:/Fuzzy_search_hosting/modules/sync_manager.py\")",
       "Bash(python -m py_compile \"d:/Fuzzy_search_hosting/routes/search_routes.py\")",
-      "Bash(python -m py_compile \"d:/Fuzzy_search_hosting/modules/cache.py\")"
+      "Bash(python -m py_compile \"d:/Fuzzy_search_hosting/modules/cache.py\")",
+      "Bash(python -m py_compile app.py)"
     ]
   }
 }

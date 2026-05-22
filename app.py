@@ -118,9 +118,15 @@ app.register_blueprint(synonym_bp)
 
 # ── Jinja filter: resolve product image path → full URL ───────────────────────
 def _get_image_base_for_db(source_db_id: int) -> str:
-    """Return configured image base URL for a source database."""
+    """Return configured image base URL for a source database.
+
+    Priority: connected_databases.image_base_url > config.IMAGE_BASE_URL.
+    """
+    from config import IMAGE_BASE_URL as _DEFAULT_BASE
+    _default = (_DEFAULT_BASE or "").strip().rstrip("/")
+
     if not source_db_id:
-        return ""
+        return _default
     conn = get_connection()
     try:
         row = conn.execute(
@@ -131,7 +137,7 @@ def _get_image_base_for_db(source_db_id: int) -> str:
         conn.close()
     image_base_url = (row["image_base_url"] if row else "") or ""
     image_base_url = image_base_url.strip().rstrip("/")
-    return image_base_url
+    return image_base_url or _default
 
 
 @app.template_filter("img_url")

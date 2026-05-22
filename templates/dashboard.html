@@ -29,9 +29,14 @@
   .bar-count { width: 40px; text-align: right; font-size: .8rem; color: #64748b; flex-shrink: 0; }
 
   .sync-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-  .sync-dot.ok    { background: #16a34a; }
-  .sync-dot.error { background: #dc2626; }
+  .sync-dot.ok      { background: #16a34a; }
+  .sync-dot.error   { background: #dc2626; }
   .sync-dot.pending { background: #d97706; }
+  .sync-dot.running { background: #2563eb; animation: pulse-dot .9s ease-in-out infinite; }
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: .35; }
+  }
 </style>
 
 <!-- Chart.js — loaded in <head> so canvases are ready when DOMContentLoaded fires -->
@@ -61,7 +66,9 @@
     <a href="/search?db_id={{ selected_db_id }}" class="btn btn-primary">
       <i class="bi bi-search me-1"></i>Search Products
     </a>
-    <button class="btn btn-outline-primary" id="btnDashRebuild" title="Drop old index and rebuild from SQLite">
+    <button class="btn btn-outline-primary" id="btnDashRebuild"
+            title="Drop old index and rebuild from SQLite"
+            data-rebuild-url="{{ '/api/search/rebuild-global' if selected_db_id == 'all' else '/api/search/rebuild?db_id=' ~ selected_db_id }}">
       <i class="bi bi-arrow-clockwise me-1"></i>Rebuild Index
     </button>
     <a href="/sync" class="btn btn-outline-secondary">
@@ -235,7 +242,7 @@
             <span class="bar-label" title="{{ row.name }}">{{ row.name }}</span>
             <div class="bar-track">
               <div class="bar-fill bg-success"
-                   style="width: {{ ((row.product_count / max_cat) * 100) | round(1) }}%;">
+                   data-pct="{{ ((row.product_count / max_cat) * 100) | round(1) }}">
               </div>
             </div>
             <span class="bar-count">{{ row.product_count }}</span>
@@ -262,7 +269,7 @@
             <span class="bar-label" title="{{ row.name }}">{{ row.name }}</span>
             <div class="bar-track">
               <div class="bar-fill bg-warning"
-                   style="width: {{ ((row.product_count / max_br) * 100) | round(1) }}%;">
+                   data-pct="{{ ((row.product_count / max_br) * 100) | round(1) }}">
               </div>
             </div>
             <span class="bar-count">{{ row.product_count }}</span>
@@ -420,7 +427,7 @@
     </span>`;
 
     try {
-      const rebuildUrl = {{ "'/api/search/rebuild-global'" if selected_db_id == 'all' else "'/api/search/rebuild?db_id=" ~ selected_db_id ~ "'" }};
+      const rebuildUrl = document.getElementById("btnDashRebuild").dataset.rebuildUrl;
       const resp = await fetch(rebuildUrl, { method: "POST" });
       const data = await resp.json();
       const newCount = data.indexed || 0;
@@ -664,6 +671,9 @@
 
   // ── Load all three charts on DOMContentLoaded ─────────────────────────────
   document.addEventListener("DOMContentLoaded", () => {
+    document.querySelectorAll(".bar-fill[data-pct]").forEach(function(el) {
+      el.style.width = el.getAttribute("data-pct") + "%";
+    });
     loadTopQueries();
     loadZeroResults();
     loadTrending();
