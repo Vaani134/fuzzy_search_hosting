@@ -1,26 +1,28 @@
 """
 modules/autocomplete.py
 -----------------------
-Fast SQLite-backed autocomplete / search suggestions with an in-memory TTL cache.
+Fast SQLite-backed autocomplete / search suggestions.
 
-Returns up to `limit` suggestions from:
-  - product names
-  - brand names
-  - category names
+Cache backend
+-------------
+Redis is used when REDIS_URL is configured and reachable.
+Falls back to in-memory OrderedDict (LRU + TTL) when Redis is unavailable.
+Both backends expose the same _cache_get / _cache_put / invalidate interface
+so the rest of the module is unaffected by which backend is active.
 
-Strategy: prefix match first (fastest), then LIKE fallback for mid-word.
-Results are deduplicated and ranked: exact prefix > contains.
+Redis key format:
+    {REDIS_KEY_PREFIX}ac:{source_db_id}:{limit}:{normalized_query}
+    e.g.  fzsearch:ac:1:10:hook
+          fzsearch:ac:global:10:hook   (source_db_id=None)
 
-Cache
------
-Results are stored in a bounded OrderedDict with TTL expiry so repeated
-keystrokes (e.g. typing "hook" then "hooka") hit memory instead of SQLite.
-  _CACHE_TTL  — seconds before an entry expires (default 30)
-  _CACHE_MAX  — maximum number of cached query tuples (default 500)
-When the cache is full, the least-recently-used entry is evicted (LRU policy).
-Call invalidate_autocomplete_cache() after a sync to force fresh results.
+TTL: 30 seconds (SETEX — Redis handles expiry natively).
+
+In-memory fallback:
+    OrderedDict with monotonic-clock TTL and LRU eviction.
+    _CACHE_MAX entries max (default 500).
 """
 
+import json
 import re
 import sys
 import os
@@ -32,49 +34,153 @@ from typing import List, Dict, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.database import get_connection
 
+# ── Cache TTL and size limits ──────────────────────────────────────────────────
+_CACHE_TTL: int = 30   # seconds
 
-# ── In-memory TTL cache ────────────────────────────────────────────────────────
-
-_cache: OrderedDict = OrderedDict()   # key → (results_list, expiry_monotonic)
-_cache_lock = threading.Lock()
-_CACHE_TTL: float = 30.0   # cache entry lifetime in seconds
-
-# Max entries — read from config so it can be tuned without code changes.
 try:
     from config import MAX_AUTOCOMPLETE_CACHE_ENTRIES as _CACHE_MAX
 except (ImportError, AttributeError):
     _CACHE_MAX = 500
 
+# ── Redis setup ────────────────────────────────────────────────────────────────
+
+try:
+    import redis as _redis_lib
+    _REDIS_AVAILABLE = True
+except ImportError:
+    _REDIS_AVAILABLE = False
+
+
+def _init_redis():
+    """
+    Try to connect to Redis using REDIS_URL from config/env.
+    Returns a connected redis.Redis client, or None on any failure.
+    """
+    if not _REDIS_AVAILABLE:
+        print("[Autocomplete] redis-py not installed — using in-memory cache.")
+        return None
+    try:
+        from config import REDIS_URL
+    except ImportError:
+        REDIS_URL = os.getenv("REDIS_URL", "")
+
+    if not REDIS_URL or not REDIS_URL.strip():
+        print("[Autocomplete] REDIS_URL not set — using in-memory cache.")
+        return None
+
+    try:
+        client = _redis_lib.from_url(
+            REDIS_URL.strip(),
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        client.ping()
+        print(f"[Autocomplete] Redis backend connected: {REDIS_URL.strip()}")
+        return client
+    except Exception as exc:
+        print(f"[Autocomplete] Redis unavailable ({exc}) — using in-memory cache.")
+        return None
+
+
+_redis_client = _init_redis()
+
+
+def _get_prefix() -> str:
+    try:
+        from config import REDIS_KEY_PREFIX
+        return REDIS_KEY_PREFIX
+    except (ImportError, AttributeError):
+        return os.getenv("REDIS_KEY_PREFIX", "fzsearch:")
+
+
+def _make_redis_key(key: tuple) -> str:
+    """
+    Build a namespaced Redis key from (normalized_query, limit, source_db_id).
+    Example: fzsearch:ac:1:10:hook
+    """
+    normalized_query, limit, source_db_id = key
+    db_part = str(source_db_id) if source_db_id is not None else "global"
+    return f"{_get_prefix()}ac:{db_part}:{limit}:{normalized_query}"
+
+
+# ── In-memory fallback cache ───────────────────────────────────────────────────
+_mem_cache: OrderedDict = OrderedDict()
+_mem_lock = threading.Lock()
+
+
+# ── Unified cache interface ────────────────────────────────────────────────────
 
 def _cache_get(key: tuple) -> Optional[List[Dict]]:
-    """Return cached results for *key*, or None on cache miss or expiry."""
-    with _cache_lock:
-        entry = _cache.get(key)
+    """Return cached results for *key*, or None on miss / expiry."""
+    # ── Redis path ─────────────────────────────────────────────────────────────
+    if _redis_client is not None:
+        try:
+            raw = _redis_client.get(_make_redis_key(key))
+            if raw is None:
+                return None
+            return json.loads(raw)
+        except Exception as exc:
+            print(f"[Autocomplete] Redis GET error: {exc}")
+            return None
+
+    # ── In-memory fallback ─────────────────────────────────────────────────────
+    with _mem_lock:
+        entry = _mem_cache.get(key)
         if entry is None:
             return None
         results, expiry = entry
         if time.monotonic() > expiry:
-            del _cache[key]
+            del _mem_cache[key]
             return None
-        _cache.move_to_end(key)
+        _mem_cache.move_to_end(key)
         return results
 
 
 def _cache_put(key: tuple, results: List[Dict]) -> None:
-    """Insert *results* into the cache; evict LRU entries when over capacity."""
+    """Store *results* under *key* with TTL."""
+    # ── Redis path ─────────────────────────────────────────────────────────────
+    if _redis_client is not None:
+        try:
+            _redis_client.setex(
+                _make_redis_key(key),
+                _CACHE_TTL,
+                json.dumps(results, ensure_ascii=False),
+            )
+        except Exception as exc:
+            print(f"[Autocomplete] Redis SET error: {exc}")
+        return
+
+    # ── In-memory fallback ─────────────────────────────────────────────────────
     expiry = time.monotonic() + _CACHE_TTL
-    with _cache_lock:
-        if key in _cache:
-            _cache.move_to_end(key)
-        _cache[key] = (results, expiry)
-        while len(_cache) > _CACHE_MAX:
-            _cache.popitem(last=False)
+    with _mem_lock:
+        if key in _mem_cache:
+            _mem_cache.move_to_end(key)
+        _mem_cache[key] = (results, expiry)
+        while len(_mem_cache) > _CACHE_MAX:
+            _mem_cache.popitem(last=False)
 
 
 def invalidate_autocomplete_cache() -> None:
-    """Clear the entire in-memory autocomplete cache (call after a sync)."""
-    with _cache_lock:
-        _cache.clear()
+    """
+    Clear all autocomplete cache entries.
+    Redis: deletes all keys matching the ac: prefix pattern.
+    In-memory: clears the OrderedDict.
+    Called after every successful sync.
+    """
+    if _redis_client is not None:
+        try:
+            pattern = f"{_get_prefix()}ac:*"
+            keys = _redis_client.keys(pattern)
+            if keys:
+                _redis_client.delete(*keys)
+                print(f"[Autocomplete] Redis: cleared {len(keys)} autocomplete key(s).")
+        except Exception as exc:
+            print(f"[Autocomplete] Redis CLEAR error: {exc}")
+        return
+
+    with _mem_lock:
+        _mem_cache.clear()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -90,13 +196,13 @@ def get_suggestions(query: str, limit: int = 10, source_db_id: Optional[int] = 1
     """
     Return autocomplete suggestions for `query`.
 
-    Results are served from the in-memory TTL cache when available.
+    Results are served from the cache (Redis or in-memory) when available.
     Cache key: (normalised_query, limit, source_db_id).
 
     Each suggestion dict:
         text          — display text
         type          — "product" | "brand" | "category"
-        id            — record id (for direct navigation on product suggestions)
+        id            — record id
         source_db_id  — originating database
         priority      — 1=product-prefix, 2=brand, 3=category, 4=product-contains
     """
