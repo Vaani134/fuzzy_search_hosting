@@ -7,7 +7,7 @@ Backend selection
 -----------------
 Redis is used when ALL of the following are true:
   1. redis-py is installed  (pip install redis)
-  2. REDIS_URL is set in the environment / .env file
+  2. R ,./1/.,mnbvcxzEDIS_URL is set in the environment / .env file
   3. The Redis server is reachable at startup
 
 If any condition fails, the cache silently falls back to the pure-Python

@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Test Dashboard — Fuzzy Search</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+  body{font-family:Arial,sans-serif;margin:0;background:#1a1a2e;color:#eee}
+  .header{background:#16213e;padding:20px 30px;display:flex;align-items:center;gap:20px}
+  .header h1{margin:0;color:#e94560} .header p{margin:0;color:#aaa}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:15px;padding:20px}
+  .card{background:#16213e;border-radius:10px;padding:20px;text-align:center}
+  .card h2{font-size:2.5em;margin:0} .card p{color:#aaa;margin:4px 0}
+  .charts{display:grid;grid-template-columns:1fr 1fr;gap:15px;padding:0 20px 20px}
+  .chart-box{background:#16213e;border-radius:10px;padding:20px}
+  table{width:100%;border-collapse:collapse} th{background:#0f3460;color:#fff;padding:8px}
+  td{padding:7px;border-bottom:1px solid #333}
+  .section{background:#16213e;border-radius:10px;margin:0 20px 20px;padding:20px}
+  .score{font-size:4em;font-weight:bold;color:#2ecc71}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>Fuzzy Search — Test Dashboard</h1>
+    <p>Generated: 2026-06-02 16:52:23</p>
+  </div>
+  <div style="margin-left:auto;text-align:right">
+    <div class="score">100.0</div>
+    <div style="color:#2ecc71;font-size:1.2em">PRODUCTION READY</div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card"><h2>222</h2><p>Total Tests</p></div>
+  <div class="card"><h2 style="color:#2ecc71">222</h2><p>Passed</p></div>
+  <div class="card"><h2 style="color:#e74c3c">0</h2><p>Failed</p></div>
+  <div class="card"><h2 style="color:#f39c12">0</h2><p>Skipped</p></div>
+  <div class="card"><h2>100.0%</h2><p>Pass Rate</p></div>
+</div>
+
+<div class="charts">
+  <div class="chart-box">
+    <h3>Pass / Fail by Category</h3>
+    <canvas id="catChart" height="250"></canvas>
+  </div>
+  <div class="chart-box">
+    <h3>Overall Pass/Fail</h3>
+    <canvas id="pieChart" height="250"></canvas>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Failed Tests</h3>
+  <p style="color:#2ecc71">No failures!</p>
+</div>
+
+
+
+<script>
+new Chart(document.getElementById('catChart'), {
+  type: 'bar',
+  data: {
+    labels: ["Unit", "Integration", "Performance", "Concurrency", "Memory"],
+    datasets: [
+      {label:'Passed', data:[141, 46, 16, 11, 8], backgroundColor:'#2ecc71'},
+      {label:'Failed', data:[0, 0, 0, 0, 0], backgroundColor:'#e74c3c'}
+    ]
+  },
+  options: {responsive:true, plugins:{legend:{labels:{color:'#eee'}}},
+    scales:{x:{ticks:{color:'#eee'}},y:{ticks:{color:'#eee'}}}}
+});
+new Chart(document.getElementById('pieChart'), {
+  type: 'doughnut',
+  data: {
+    labels: ['Passed','Failed','Skipped'],
+    datasets: [{data:[222,0,0],
+      backgroundColor:['#2ecc71','#e74c3c','#f39c12']}]
+  },
+  options: {responsive:true,plugins:{legend:{labels:{color:'#eee'}}}}
+});
+</script>
+</body></html>

@@ -1,0 +1,91 @@
+{
+  "generated_at": "2026-06-02T16:52:23.513958",
+  "overall_status": "PASS",
+  "production_readiness_score": 100.0,
+  "grade": "A",
+  "grade_label": "Production Ready (90-100)",
+  "summary": {
+    "total": 222,
+    "passed": 222,
+    "failed": 0,
+    "pass_rate_pct": 100.0
+  },
+  "startup_tests": {
+    "pass_rate": 100.0,
+    "total": 141,
+    "passed": 141,
+    "failed": 0
+  },
+  "cache_tests": {
+    "pass_rate": 100.0,
+    "total": 141,
+    "passed": 141,
+    "failed": 0
+  },
+  "search_tests": {
+    "pass_rate": 100.0,
+    "total": 46,
+    "passed": 46,
+    "failed": 0
+  },
+  "autocomplete_tests": {
+    "pass_rate": 100.0,
+    "total": 46,
+    "passed": 46,
+    "failed": 0
+  },
+  "concurrency_tests": {
+    "pass_rate": 100.0,
+    "total": 11,
+    "passed": 11,
+    "failed": 0
+  },
+  "memory_tests": {
+    "pass_rate": 100.0,
+    "total": 8,
+    "passed": 8,
+    "failed": 0
+  },
+  "performance_tests": {
+    "pass_rate": 100.0,
+    "total": 16,
+    "passed": 16,
+    "failed": 0
+  },
+  "category_breakdown": {
+    "unit": {
+      "pass_rate": 100.0,
+      "total": 141,
+      "passed": 141,
+      "failed": 0
+    },
+    "integration": {
+      "pass_rate": 100.0,
+      "total": 46,
+      "passed": 46,
+      "failed": 0
+    },
+    "performance": {
+      "pass_rate": 100.0,
+      "total": 16,
+      "passed": 16,
+      "failed": 0
+    },
+    "concurrency": {
+      "pass_rate": 100.0,
+      "total": 11,
+      "passed": 11,
+      "failed": 0
+    },
+    "memory": {
+      "pass_rate": 100.0,
+      "total": 8,
+      "passed": 8,
+      "failed": 0
+    }
+  },
+  "benchmarks": {},
+  "recommendations": [
+    "All checks passed \u2014 system is production ready"
+  ]
+}
