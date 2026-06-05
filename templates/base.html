@@ -660,7 +660,8 @@ document.addEventListener("DOMContentLoaded", () => {
   async function fetchSuggestions(q) {
     if (q.length < 2) { dropdown.classList.remove("open"); return; }
     try {
-      const resp  = await fetch(`/api/autocomplete?q=${encodeURIComponent(q)}&limit=10`);
+      const dbId = input.closest("form")?.querySelector('input[name="db_id"]')?.value || "1";
+      const resp  = await fetch(`/api/autocomplete?q=${encodeURIComponent(q)}&limit=10&db_id=${encodeURIComponent(dbId)}`);
       const items = await resp.json();
       render(items, q);
     } catch { dropdown.classList.remove("open"); }

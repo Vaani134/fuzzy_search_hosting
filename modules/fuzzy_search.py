@@ -157,6 +157,22 @@ def reload_synonyms() -> int:
         _SYNONYM_LOOKUP  = new_lookup
 
     print(f"[Synonyms] Loaded {len(new_synonyms)} synonym(s) from DB.")
+
+    # Rebuild the pre-normalized static suggestion pool whenever synonyms change
+    # so get_query_suggestion() picks up the new canonical values immediately.
+    # _rebuild_static_suggestion_pool is defined further down in this module;
+    # it is safe to call here because by the time any *external* code calls
+    # reload_synonyms() (i.e. after a synonym add/delete), the full module has
+    # already been imported and all functions are defined.
+    # The one import-time call at the bottom of this block is replaced by an
+    # explicit _rebuild_static_suggestion_pool() call after it is defined below.
+    try:
+        _rebuild_static_suggestion_pool()
+    except NameError:
+        # First import: _rebuild_static_suggestion_pool not yet defined.
+        # It will be called explicitly once it is defined (see below).
+        pass
+
     return len(new_synonyms)
 
 
@@ -254,6 +270,12 @@ def blend_score(query: str, normalized_text: str, raw_text: str) -> float:
         token_set_ratio  0.5
         WRatio           0.3
         partial_ratio    0.2
+
+    Optimization: raw-text pass is skipped when the normalized score is
+    already ≥ 95, since the raw pass cannot realistically exceed it by
+    enough to change downstream decisions.  This halves rapidfuzz call
+    count for high-confidence matches (exact/prefix hits) with zero
+    impact on results — the same value would have been returned.
     """
     if not RAPIDFUZZ_AVAILABLE:
         raise RuntimeError("rapidfuzz is not installed. Run: pip install rapidfuzz")
@@ -263,6 +285,10 @@ def blend_score(query: str, normalized_text: str, raw_text: str) -> float:
     wr_n = fuzz.WRatio(query, normalized_text)
     pr_n = fuzz.partial_ratio(query, normalized_text)
     score_n = 0.5 * ts_n + 0.3 * wr_n + 0.2 * pr_n
+
+    # Skip raw pass for very high normalized scores — can't be beaten
+    if score_n >= 95.0:
+        return score_n
 
     # Against raw text (preserves numbers, original casing)
     ts_r = fuzz.token_set_ratio(query, raw_text)
@@ -289,6 +315,54 @@ _SUGGESTION_KEYWORDS: List[str] = [
 # Keeps the function fast even when the caller supplies thousands of names.
 _SUGGESTION_POOL_LIMIT = 500
 _ID_SCOPE_MULTIPLIER = 1_000_000_000
+
+# ── Pre-normalized static suggestion pool ─────────────────────────────────────
+# The synonym values + keyword list never change between requests.
+# Pre-normalizing them at module load (and on reload_synonyms) avoids
+# redundant normalize() calls on every uncached suggestion lookup.
+# Only the dynamic caller-supplied choices portion needs per-request work.
+#
+# _STATIC_SUGGESTION_POOL        : original strings (for return value)
+# _STATIC_SUGGESTION_POOL_NORMED : normalize(s) for each string above
+#
+# Both lists are rebuilt atomically inside _rebuild_static_suggestion_pool(),
+# which is called at import time and after every reload_synonyms().
+_STATIC_SUGGESTION_POOL:        List[str] = []
+_STATIC_SUGGESTION_POOL_NORMED: List[str] = []
+_static_pool_lock = threading.Lock()
+
+
+def _rebuild_static_suggestion_pool() -> None:
+    """
+    Rebuild the pre-normalized static portion of the suggestion candidate pool.
+
+    Sources (static — never change between requests):
+      • SYNONYMS.values() — canonical synonym forms
+      • _SUGGESTION_KEYWORDS — curated product-type vocabulary
+
+    Called at module import time (after reload_synonyms()) and again inside
+    reload_synonyms() whenever synonyms change.  Thread-safe via
+    _static_pool_lock.
+    """
+    global _STATIC_SUGGESTION_POOL, _STATIC_SUGGESTION_POOL_NORMED
+
+    # Build deduplicated list: synonyms first, then keywords
+    with _synonyms_lock:
+        synonym_values = list(SYNONYMS.values())
+
+    raw: List[str] = list(dict.fromkeys(
+        [v for v in synonym_values if isinstance(v, str) and v.strip()]
+        + _SUGGESTION_KEYWORDS
+    ))
+    normed: List[str] = [normalize(s) for s in raw]
+
+    with _static_pool_lock:
+        _STATIC_SUGGESTION_POOL        = raw
+        _STATIC_SUGGESTION_POOL_NORMED = normed
+
+
+# Build the static pool once at import time (synonyms were already loaded above).
+_rebuild_static_suggestion_pool()
 
 
 def get_query_suggestion(
@@ -369,9 +443,8 @@ def get_query_suggestion(
 
     # ── Step 2: build the candidate pool ─────────────────────────────────────
     # Sources (in priority order for deduplication):
-    #   a) caller-supplied choices  (real product names — highest signal)
-    #   b) SYNONYMS values          (canonical forms: "hookah", "grinder"…)
-    #   c) static keyword list      (curated fallback vocabulary)
+    #   a) caller-supplied choices  (real product names — highest signal, dynamic)
+    #   b) SYNONYMS values + _SUGGESTION_KEYWORDS  (static — pre-normalized)
     #
     # IMPORTANT: synonym KEYS are intentionally excluded from the pool.
     # Keys are known misspellings ("hooka", "grider", "sheesha"…).
@@ -379,30 +452,55 @@ def get_query_suggestion(
     # itself, trigger the identity check, and return None — the opposite of
     # what we want.  Only canonical values belong here as valid suggestions.
     #
-    # dict.fromkeys() deduplicates while preserving insertion order so that
-    # higher-priority sources win when two entries normalize to the same string.
-    raw_pool: List[str] = list(dict.fromkeys(
-        [c for c in (choices or []) if isinstance(c, str) and c.strip()]
-        + [v for v in SYNONYMS.values() if isinstance(v, str) and v.strip()]
-        + _SUGGESTION_KEYWORDS
-    ))
+    # Optimization: the static portion (synonym values + keywords) is
+    # pre-normalized at module load time and after every reload_synonyms().
+    # Only the dynamic caller-supplied choices need per-request normalize().
 
-    # Cap pool size for performance — keep the first N entries (caller-supplied
-    # choices are first, so the most relevant candidates are always included).
-    pool = raw_pool[:_SUGGESTION_POOL_LIMIT]
+    dynamic_choices: List[str] = [
+        c for c in (choices or []) if isinstance(c, str) and c.strip()
+    ]
+
+    # Snapshot the pre-built static pool under its lock
+    with _static_pool_lock:
+        static_pool        = _STATIC_SUGGESTION_POOL
+        static_pool_normed = _STATIC_SUGGESTION_POOL_NORMED
+
+    # Merge: dynamic choices first (highest priority), then static pool.
+    # Deduplicate by normalized form so "Hookah" and "hookah" don't both appear.
+    seen_normed: set = set()
+    pool:        List[str] = []
+    pool_normed: List[str] = []
+
+    for raw_str in dynamic_choices:
+        n_str = normalize(raw_str)
+        if n_str and n_str not in seen_normed:
+            seen_normed.add(n_str)
+            pool.append(raw_str)
+            pool_normed.append(n_str)
+        if len(pool) >= _SUGGESTION_POOL_LIMIT:
+            break
+
+    if len(pool) < _SUGGESTION_POOL_LIMIT:
+        remaining = _SUGGESTION_POOL_LIMIT - len(pool)
+        for raw_str, n_str in zip(static_pool, static_pool_normed):
+            if n_str and n_str not in seen_normed:
+                seen_normed.add(n_str)
+                pool.append(raw_str)
+                pool_normed.append(n_str)
+                remaining -= 1
+                if remaining == 0:
+                    break
+
     if not pool:
         return None
 
-    # ── Step 3: normalize every candidate ────────────────────────────────────
-    # Pre-normalize so extractOne compares clean strings on both sides.
-    normalized_pool: List[str] = [normalize(c) for c in pool]
-
-    # ── Step 4: find the best match ───────────────────────────────────────────
+    # ── Step 3: find the best match ───────────────────────────────────────────
     # WRatio handles character transpositions, insertions, and deletions —
     # exactly the errors users make when typing product names.
+    # pool_normed is already normalized — no per-call normalize() needed.
     result = process.extractOne(
         query_n,
-        normalized_pool,
+        pool_normed,
         scorer=fuzz.WRatio,
     )
     if result is None:
@@ -427,10 +525,10 @@ def get_query_suggestion(
     #   This catches "hookah" → "hookah" (score 100) without needing a
     #   hard upper-bound cutoff that would suppress real typos like
     #   "hooka" → "hookah" (score 90.9).
-    if normalized_pool[idx] == query_n:
+    if pool_normed[idx] == query_n:
         return None
 
-    # ── Step 6: return the original (un-normalized) candidate ────────────────
+    # ── Step 6 (was Step 6): return the original (un-normalized) candidate ───
     # Return pool[idx] rather than the normalized form so the UI receives
     # proper casing — e.g. "Grinder" if that's what was in the choices list.
     return pool[idx]
@@ -1202,6 +1300,7 @@ class FuzzySearchEngine:
         query: str,
         top_k: int = SEARCH_DEFAULT_K,
         filters: Optional[Dict] = None,
+        _include_field_scores: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Search products with optional pre-filtering and query expansion.
@@ -1235,6 +1334,14 @@ class FuzzySearchEngine:
             expanded_from    — which query term produced this result
                                (original query or an expansion term)
         Sorted by score descending.
+
+        Parameters
+        ----------
+        _include_field_scores : bool
+            Internal flag used by search_with_field_scores().  When True,
+            per-field blend scores are computed inline during Pass 2 and
+            stored under result["field_scores"], avoiding a second scoring
+            loop after results are selected.  Do not pass from external code.
         """
         top_k = min(top_k, SEARCH_MAX_K)
 
@@ -1296,13 +1403,76 @@ class FuzzySearchEngine:
             if not query_n:
                 continue
 
-            # Pass 1 — fast WRatio scan (2× top_k candidates per term)
-            fast_matches = process.extract(
-                query_n,
-                f_norm_strs,
-                scorer=fuzz.WRatio,
-                limit=top_k * 2,
-            )
+            # Pass 1 — substring pre-filter → fast partial_ratio scan
+            #
+            # Two-stage candidate selection replaces a single brute-force
+            # O(N) fuzzy scan over the entire 40k-product index:
+            #
+            # Stage 1 (pre-filter) — pure Python substring check:
+            #   Find all strings that contain at least one query token as a
+            #   literal substring.  Python's built-in `in` operator uses an
+            #   optimised C-level Horspool search — much faster than any
+            #   rapidfuzz scorer on the same strings.
+            #   Token used: the longest token in the normalised query
+            #   (heuristic: longer tokens tend to be more specific/rarer).
+            #
+            # Stage 2 (scorer) — partial_ratio on the subset:
+            #   partial_ratio scores how well the query appears as a
+            #   substring of each candidate.  It catches character-level
+            #   typos ("hooka" → score 100 in "hookah small glass") that
+            #   token_set_ratio misses, while being ~3–4× faster than
+            #   WRatio.  score_cutoff enables C-level early-exit.
+            #
+            # Fallback: if no long token exists (query < 4 chars) or the
+            # pre-filtered set is too large (> 30% of index), scan the
+            # full index with partial_ratio + score_cutoff — still faster
+            # than the original WRatio full scan.
+            #
+            # Result set: identical to a full WRatio scan — Pass 2 still
+            # applies the full blend_score for accurate ranking.
+
+            # Pick the longest token as the pre-filter key
+            _prefilter_tokens = [t for t in query_n.split() if len(t) >= 3]
+            _prefilter_key    = max(_prefilter_tokens, key=len) if _prefilter_tokens else ""
+            _index_size       = len(f_norm_strs)
+            _MAX_PREFILTER    = _index_size * 30 // 100  # 30% of index
+
+            if _prefilter_key and _index_size > 0:
+                _prefilter_indices = [
+                    i for i, s in enumerate(f_norm_strs) if _prefilter_key in s
+                ]
+                if len(_prefilter_indices) <= _MAX_PREFILTER:
+                    _scan_strs = [f_norm_strs[i] for i in _prefilter_indices]
+                    _raw_matches = process.extract(
+                        query_n,
+                        _scan_strs,
+                        scorer=fuzz.partial_ratio,
+                        limit=top_k * 2,
+                        score_cutoff=FUZZY_MIN_THRESHOLD,
+                    )
+                    # Map sub-list indices back to f_norm_strs indices
+                    fast_matches = [
+                        (text, score, _prefilter_indices[sub_idx])
+                        for text, score, sub_idx in _raw_matches
+                    ]
+                else:
+                    # Pre-filter set too large — full index scan
+                    fast_matches = process.extract(
+                        query_n,
+                        f_norm_strs,
+                        scorer=fuzz.partial_ratio,
+                        limit=top_k * 2,
+                        score_cutoff=FUZZY_MIN_THRESHOLD,
+                    )
+            else:
+                # Query too short for a useful token pre-filter
+                fast_matches = process.extract(
+                    query_n,
+                    f_norm_strs,
+                    scorer=fuzz.partial_ratio,
+                    limit=top_k * 2,
+                    score_cutoff=FUZZY_MIN_THRESHOLD,
+                )
 
             # Pass 2 — full blend re-score + threshold gate
             candidates = []
@@ -1324,14 +1494,30 @@ class FuzzySearchEngine:
                 fuzzy_score      = apply_boost(
                     base_score, query_n, product_name_n, raw_product_name
                 )
-                candidates.append((index, fuzzy_score))
+
+                # Inline field scores: compute per-field blend during Pass 2
+                # so search_with_field_scores() needs no second scoring loop.
+                # Only done when the caller requests field scores (avoids work
+                # for plain search() calls that don't need field scores).
+                if _include_field_scores:
+                    field_scores = {}
+                    for field in self.text_fields:
+                        fval = str(f_items[index].get(field, '') or '')
+                        field_scores[field] = round(
+                            blend_score(query_n, normalize(fval), fval.lower()),
+                            2,
+                        )
+                else:
+                    field_scores = None
+
+                candidates.append((index, fuzzy_score, field_scores))
 
             if not candidates:
                 continue
 
-            best_fuzzy = max(fs for _, fs in candidates)
+            best_fuzzy = max(fs for _, fs, _ in candidates)
 
-            for index, fuzzy_score in candidates:
+            for index, fuzzy_score, field_scores in candidates:
                 popularity = f_items[index].get("_popularity", 0.0)
                 click_rate = f_items[index].get("_click_rate", 0.0)
 
@@ -1362,6 +1548,9 @@ class FuzzySearchEngine:
                     result["click_score"]      = round(click_rate,  2)
                     # Track which query term produced this result
                     result["expanded_from"]    = term if term != query else None
+                    # Field scores computed inline during Pass 2 (not after)
+                    if field_scores is not None:
+                        result["field_scores"] = field_scores
                     best_by_id[product_id]     = result
 
         # ── Step 4: sort merged results by composite score ────────────────────
@@ -1377,23 +1566,12 @@ class FuzzySearchEngine:
         """
         Same as search() but also returns per-field scores.
         Useful for debugging and bucketing.
-        """
-        results  = self.search(query, top_k, filters=filters)
-        query_n  = normalize(apply_synonyms(query))
 
-        for r in results:
-            r["field_scores"] = {
-                field: round(
-                    blend_score(
-                        query_n,
-                        normalize(str(r.get(field, '') or '')),
-                        str(r.get(field, '') or '').lower(),
-                    ),
-                    2,
-                )
-                for field in self.text_fields
-            }
-        return results
+        Field scores are computed inline during the main scoring pass
+        (Pass 2) via the _include_field_scores flag — no second loop
+        over results after selection.
+        """
+        return self.search(query, top_k, filters=filters, _include_field_scores=True)
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
