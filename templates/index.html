@@ -45,6 +45,52 @@
   }
   #btn-image-search:hover { color: var(--brand-primary); background: #eff6ff; }
 
+  /* ── Product detail modal ── */
+  #product-modal .modal-dialog {
+    max-width: 780px;
+  }
+  #product-modal .modal-product-img {
+    width: 100%;
+    max-height: 280px;
+    object-fit: contain;
+    background: #f8fafc;
+    border-radius: .5rem;
+    padding: .75rem;
+  }
+  #product-modal .modal-product-img-placeholder {
+    width: 100%;
+    height: 200px;
+    background: #f1f5f9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: .5rem;
+    font-size: 4rem;
+    color: #94a3b8;
+  }
+  #product-modal .modal-spinner {
+    min-height: 200px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    color: #6b7280;
+  }
+  #product-modal .modal-error {
+    min-height: 160px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: .75rem;
+    color: #dc2626;
+  }
+  /* Make product name / image links trigger modal */
+  .product-card .product-modal-trigger {
+    cursor: pointer;
+  }
+
   /* ── Image search status (uploading / error) ── */
   #img-search-status {
     display: none;
@@ -349,7 +395,12 @@
       </div>
 
       <!-- Product image -->
-      <a href="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}">
+      <a href="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}"
+         class="product-modal-trigger"
+         data-db-id="{{ p.source_db_id }}"
+         data-product-id="{{ p.source_product_id or p.id }}"
+         data-fallback-url="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}"
+         onclick="openProductModal(event, this)">
         {% if img %}
         <img
           src="{{ img }}"
@@ -371,8 +422,13 @@
 
         <!-- Name (highlighted) -->
         <h6 class="card-title mb-1">
-          <a href="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}" class="text-decoration-none text-dark stretched-link-off"
-             data-product-name="{{ p.name }}">
+          <a href="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}"
+             class="text-decoration-none text-dark stretched-link-off product-modal-trigger"
+             data-db-id="{{ p.source_db_id }}"
+             data-product-id="{{ p.source_product_id or p.id }}"
+             data-fallback-url="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}"
+             data-product-name="{{ p.name }}"
+             onclick="openProductModal(event, this)">
             {{ p.name }}
           </a>
         </h6>
@@ -437,7 +493,12 @@
           {% endif %}
 
           <!-- Detail link -->
-          <a href="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}" class="btn btn-outline-primary btn-sm w-100 mt-2">
+          <a href="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}"
+             class="btn btn-outline-primary btn-sm w-100 mt-2 product-modal-trigger"
+             data-db-id="{{ p.source_db_id }}"
+             data-product-id="{{ p.source_product_id or p.id }}"
+             data-fallback-url="/product/{{ p.source_db_id }}/{{ p.source_product_id or p.id }}"
+             onclick="openProductModal(event, this)">
             <i class="bi bi-eye me-1"></i>View Details
           </a>
         </div>
@@ -513,10 +574,283 @@
 {% endblock %}
 
 {% block extra_scripts %}
+
+<!-- ── Product Detail Modal ─────────────────────────────────────────────── -->
+<div class="modal fade" id="product-modal" tabindex="-1"
+     aria-labelledby="product-modal-label" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-content">
+
+      <!-- Header -->
+      <div class="modal-header border-0 pb-0">
+        <h5 class="modal-title fw-bold" id="product-modal-label">Product Details</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"
+                aria-label="Close"></button>
+      </div>
+
+      <!-- Body — swaps between spinner / error / content -->
+      <div class="modal-body pt-2" id="product-modal-body">
+        <!-- Spinner (shown while loading) -->
+        <div id="pmodal-spinner" class="modal-spinner">
+          <div class="spinner-border text-primary" role="status" style="width:2.5rem;height:2.5rem;"></div>
+          <span class="text-muted">Loading product details…</span>
+        </div>
+        <!-- Error state -->
+        <div id="pmodal-error" class="modal-error" style="display:none;">
+          <i class="bi bi-exclamation-triangle-fill fs-1"></i>
+          <p class="mb-0 fw-semibold" id="pmodal-error-msg">Could not load product details.</p>
+          <a id="pmodal-fallback-link" href="#" class="btn btn-outline-primary btn-sm mt-1">
+            <i class="bi bi-box-arrow-up-right me-1"></i>Open product page
+          </a>
+        </div>
+        <!-- Content (hidden until loaded) -->
+        <div id="pmodal-content" style="display:none;">
+          <div class="row g-3">
+            <!-- Image -->
+            <div class="col-md-4 text-center">
+              <img id="pmodal-img" src="" alt=""
+                   class="modal-product-img"
+                   onerror="this.style.display='none';
+                            document.getElementById('pmodal-img-placeholder').style.display='flex';" />
+              <div id="pmodal-img-placeholder" class="modal-product-img-placeholder" style="display:none;">
+                <i class="bi bi-box-seam"></i>
+              </div>
+            </div>
+            <!-- Details -->
+            <div class="col-md-8">
+              <h4 class="fw-bold mb-1" id="pmodal-name"></h4>
+              <!-- Badges -->
+              <div class="mb-2 d-flex flex-wrap gap-1" id="pmodal-badges"></div>
+              <!-- Price -->
+              <div class="mb-3" id="pmodal-price"></div>
+              <!-- Description -->
+              <p class="text-muted small mb-3" id="pmodal-description" style="display:none;"></p>
+              <!-- Fields table -->
+              <table class="table table-sm table-bordered mb-0" id="pmodal-table">
+                <tbody id="pmodal-table-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <div class="modal-footer border-0 pt-0" id="product-modal-footer" style="display:none;">
+        <a id="pmodal-open-page" href="#" class="btn btn-outline-secondary btn-sm"
+           target="_blank" rel="noopener">
+          <i class="bi bi-box-arrow-up-right me-1"></i>Open full page
+        </a>
+        <button type="button" id="pmodal-cart-btn"
+                class="btn btn-outline-primary btn-sm"
+                onclick="handleModalCart(this)">
+          <i class="bi bi-download me-1"></i>Add to Download Cart
+        </button>
+        <button type="button" class="btn btn-secondary btn-sm"
+                data-bs-dismiss="modal">Close</button>
+      </div>
+
+    </div>
+  </div>
+</div>
+
 <script>
   // ── Loading indicator ──────────────────────────────────────────────────────
   function showLoading() {
     document.getElementById("search-loading").classList.add("active");
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PRODUCT DETAIL MODAL
+  // ═══════════════════════════════════════════════════════════════════════════
+  (function () {
+    const modalEl   = document.getElementById("product-modal");
+    const bsModal   = new bootstrap.Modal(modalEl, { backdrop: true });
+
+    const spinner   = document.getElementById("pmodal-spinner");
+    const errorDiv  = document.getElementById("pmodal-error");
+    const errorMsg  = document.getElementById("pmodal-error-msg");
+    const fallbackA = document.getElementById("pmodal-fallback-link");
+    const content   = document.getElementById("pmodal-content");
+    const footer    = document.getElementById("product-modal-footer");
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+    function esc(str) {
+      return String(str ?? "")
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function showSpinner() {
+      spinner.style.display  = "";
+      errorDiv.style.display = "none";
+      content.style.display  = "none";
+      footer.style.display   = "none";
+      document.getElementById("product-modal-label").textContent = "Product Details";
+    }
+
+    function showError(msg, fallbackUrl) {
+      spinner.style.display  = "none";
+      errorDiv.style.display = "";
+      content.style.display  = "none";
+      footer.style.display   = "none";
+      errorMsg.textContent   = msg || "Could not load product details.";
+      fallbackA.href         = fallbackUrl || "#";
+    }
+
+    function fmt(val) {
+      return val !== null && val !== undefined && val !== "" ? esc(val) : null;
+    }
+
+    function showContent(p, fallbackUrl) {
+      spinner.style.display  = "none";
+      errorDiv.style.display = "none";
+      content.style.display  = "";
+      footer.style.display   = "";
+
+      // Title
+      document.getElementById("product-modal-label").textContent = p.name || "Product Details";
+      document.getElementById("pmodal-name").textContent = p.name || "";
+
+      // Image
+      const imgEl    = document.getElementById("pmodal-img");
+      const phEl     = document.getElementById("pmodal-img-placeholder");
+      const imageUrl = p.image_url || "";
+      if (imageUrl) {
+        imgEl.src          = imageUrl;
+        imgEl.alt          = p.name || "";
+        imgEl.style.display = "";
+        phEl.style.display  = "none";
+      } else {
+        imgEl.style.display = "none";
+        phEl.style.display  = "flex";
+      }
+
+      // Badges
+      const badges = document.getElementById("pmodal-badges");
+      badges.innerHTML = "";
+      if (p.brand_name)    badges.innerHTML += `<span class="badge bg-secondary">${esc(p.brand_name)}</span>`;
+      if (p.category_name) badges.innerHTML += `<span class="badge bg-primary">${esc(p.category_name)}</span>`;
+      if (p.group_name)    badges.innerHTML += `<span class="badge bg-info text-dark">${esc(p.group_name)}</span>`;
+      if (p.out_of_stock)  badges.innerHTML += `<span class="badge bg-danger">Out of Stock</span>`;
+      if (p.is_inactive)   badges.innerHTML += `<span class="badge bg-warning text-dark">Inactive</span>`;
+
+      // Price
+      const priceEl = document.getElementById("pmodal-price");
+      if (p.sales_price) {
+        priceEl.innerHTML = `<span class="fs-4 fw-bold text-success">$${parseFloat(p.sales_price).toFixed(2)}</span>`;
+        if (p.srp && p.srp !== p.sales_price) {
+          priceEl.innerHTML += ` <span class="text-muted text-decoration-line-through ms-2">$${parseFloat(p.srp).toFixed(2)}</span>`;
+        }
+      } else if (p.srp) {
+        priceEl.innerHTML = `<span class="fs-4 fw-bold text-secondary">$${parseFloat(p.srp).toFixed(2)}</span>`;
+      } else {
+        priceEl.innerHTML = `<span class="text-muted">Price not set</span>`;
+      }
+
+      // Description
+      const descEl = document.getElementById("pmodal-description");
+      if (p.product_description) {
+        descEl.textContent  = p.product_description;
+        descEl.style.display = "";
+      } else {
+        descEl.style.display = "none";
+      }
+
+      // Fields table
+      const tbody = document.getElementById("pmodal-table-body");
+      const rows  = [
+        ["SKU",        fmt(p.sku)],
+        ["SKU 2",      fmt(p.sku2)],
+        ["Item Code",  fmt(p.item_code)],
+        ["Qty / Box",  fmt(p.qty_box)],
+        ["Case Qty",   fmt(p.case_qty)],
+        ["Variation",  fmt(p.group_variation_name)],
+        ["Note",       fmt(p.note)],
+        ["Last Updated", fmt(p.updated_at)],
+      ];
+      // Location: only add if at least one field has a value
+      if (p.aisle || p.rack || p.shelf || p.bin) {
+        rows.push(["Location",
+          `Aisle ${esc(p.aisle ?? "—")} &bull; Rack ${esc(p.rack ?? "—")} &bull; Shelf ${esc(p.shelf ?? "—")} &bull; Bin ${esc(p.bin ?? "—")}`
+        ]);
+      }
+      tbody.innerHTML = rows
+        .filter(([, v]) => v !== null)
+        .map(([label, val]) =>
+          `<tr><th class="w-35 bg-light" style="white-space:nowrap;">${esc(label)}</th><td>${val}</td></tr>`
+        ).join("");
+
+      // Footer links
+      document.getElementById("pmodal-open-page").href = fallbackUrl || "#";
+
+      // Cart button state
+      const cartBtn = document.getElementById("pmodal-cart-btn");
+      cartBtn.dataset.productId   = p.id;
+      cartBtn.dataset.productName = p.name || "";
+      cartBtn.dataset.productImg  = imageUrl;
+      if (CartManager.has(p.id)) {
+        cartBtn.innerHTML = '<i class="bi bi-check me-1"></i>In Download Cart';
+        cartBtn.classList.replace("btn-outline-primary", "btn-success");
+      } else {
+        cartBtn.innerHTML = '<i class="bi bi-download me-1"></i>Add to Download Cart';
+        cartBtn.classList.replace("btn-success", "btn-outline-primary");
+      }
+    }
+
+    // ── Public: open modal and fetch product ─────────────────────────────────
+    window.openProductModal = function (event, triggerEl) {
+      event.preventDefault();
+
+      const dbId       = triggerEl.dataset.dbId;
+      const productId  = triggerEl.dataset.productId;
+      const fallbackUrl = triggerEl.dataset.fallbackUrl ||
+                          `/product/${dbId}/${productId}`;
+
+      showSpinner();
+      bsModal.show();
+
+      fetch(`/api/product/${dbId}/${productId}`)
+        .then(resp => {
+          if (!resp.ok) {
+            return resp.json().then(d => {
+              throw new Error(d.error || `HTTP ${resp.status}`);
+            }).catch(() => { throw new Error(`HTTP ${resp.status}`); });
+          }
+          return resp.json();
+        })
+        .then(product => {
+          // Record click (fire-and-forget, same as product.html does)
+          fetch(`/api/product/${product.id}/click`, { method: "POST" }).catch(() => {});
+          showContent(product, fallbackUrl);
+        })
+        .catch(err => {
+          showError(
+            `Could not load product details: ${err.message}`,
+            fallbackUrl
+          );
+        });
+    };
+
+    // ── ESC key is handled natively by Bootstrap's modal ────────────────────
+    // (bootstrap.Modal already closes on Escape and outside-click by default)
+
+  })();
+
+  // ── Modal cart button handler ─────────────────────────────────────────────
+  function handleModalCart(btn) {
+    const id   = parseInt(btn.dataset.productId);
+    const name = btn.dataset.productName;
+    const img  = btn.dataset.productImg;
+
+    if (CartManager.has(id)) {
+      CartManager.remove(id);
+      btn.innerHTML = '<i class="bi bi-download me-1"></i>Add to Download Cart';
+      btn.classList.replace("btn-success", "btn-outline-primary");
+    } else {
+      CartManager.add(id, name, img);
+      btn.innerHTML = '<i class="bi bi-check me-1"></i>In Download Cart';
+      btn.classList.replace("btn-outline-primary", "btn-success");
+    }
   }
 
   // ── Highlight query terms in product names ─────────────────────────────────

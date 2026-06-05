@@ -658,6 +658,62 @@ def api_product(product_id: int):
     if not row:
         return jsonify({"error": "Product not found"}), 404
 
+
+@app.route("/api/product/<int:db_id>/<int:product_id>")
+def api_product_scoped(db_id: int, product_id: int):
+    """
+    GET /api/product/<db_id>/<product_id> — scoped product detail JSON.
+
+    Mirrors the HTML route /product/<db_id>/<product_id> but returns JSON
+    for AJAX product-detail modal popups on the search page.
+    Applies the same scoped-id → unscoped-id fallback for backward compat.
+    """
+    scoped_id = db_id * 1_000_000_000 + product_id
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT p.*,
+                   COALESCE(b.name, '')  AS brand_name,
+                   COALESCE(c.name, '')  AS category_name,
+                   COALESCE(pg.name, '') AS group_name
+            FROM products p
+            LEFT JOIN brands        b  ON b.id  = p.brand_id
+            LEFT JOIN categories    c  ON c.id  = p.category_id
+            LEFT JOIN product_group pg ON pg.id = p.product_group_id
+            WHERE p.id = ? AND p.source_db_id = ?
+            """,
+            (scoped_id, db_id),
+        ).fetchone()
+        if not row:
+            row = conn.execute(
+                """
+                SELECT p.*,
+                       COALESCE(b.name, '')  AS brand_name,
+                       COALESCE(c.name, '')  AS category_name,
+                       COALESCE(pg.name, '') AS group_name
+                FROM products p
+                LEFT JOIN brands        b  ON b.id  = p.brand_id
+                LEFT JOIN categories    c  ON c.id  = p.category_id
+                LEFT JOIN product_group pg ON pg.id = p.product_group_id
+                WHERE p.id = ? AND p.source_db_id = ?
+                """,
+                (product_id, db_id),
+            ).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        return jsonify({"error": "Product not found"}), 404
+
+    product = dict_from_row(row)
+
+    # Resolve image URL server-side so the modal JS doesn't need the Jinja filter
+    img_path = product.get("main_image") or product.get("image") or ""
+    product["image_url"] = img_url_filter(img_path, db_id) if img_path else ""
+
+    return jsonify(product)
+
     return jsonify(dict_from_row(row))
 
 
