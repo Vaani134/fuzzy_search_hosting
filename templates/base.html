@@ -22,7 +22,36 @@
     body { background: #f8fafc; }
 
     /* ── Navbar ── */
-    .navbar-brand { font-weight: 700; letter-spacing: -0.5px; }
+    .navbar-brand {
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      display: inline-flex;
+      align-items: center;
+    }
+    .navbar-logo {
+      max-width: 270px;
+      max-height: auto;
+      width: auto;
+      height: auto;
+      display: inline-block;
+    }
+    .navbar-brand-text {
+      display: none;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+    @media (max-width: 768px) {
+      .navbar-logo {
+        max-width: 160px;
+      }
+    }
+    @media (max-width: 576px) {
+      .navbar-logo {
+        max-width: 140px;
+      }
+    }
 
     /* ── Search bar ── */
     .search-wrapper { max-width: 680px; margin: 0 auto; }
@@ -242,7 +271,13 @@
 <nav class="navbar navbar-expand-lg navbar-dark" style="background: var(--brand-primary);">
   <div class="container">
     <a class="navbar-brand" href="/">
-      <i class="bi bi-search me-2"></i>FuzzySearch
+      <img
+        src="{{ url_for('static', filename='images/Scout_logo.png') }}"
+        alt="Scout"
+        class="navbar-logo"
+        onerror="this.style.display='none'; this.nextElementSibling.style.display='inline';"
+      />
+      <span class="navbar-brand-text">FuzzySearch</span>
     </a>
     <div class="d-flex gap-3 ms-auto">
       <a href="/"         class="nav-link text-white {% if request.path == '/' %}fw-bold{% endif %}">
