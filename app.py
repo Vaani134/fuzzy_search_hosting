@@ -154,11 +154,16 @@ def img_url_filter(path: str, source_db_id: int = None) -> str:
     """
     if not path:
         return ""
+
+    path = path.strip()
+    if not path:
+        return ""
+
     if path.startswith("http://") or path.startswith("https://"):
         return path
 
-    clean = path.lstrip("/")
-
+    import re
+    clean = re.sub(r"[\\/]+", "/", path).lstrip("/")
     base = _get_image_base_for_db(source_db_id)
 
     if base:

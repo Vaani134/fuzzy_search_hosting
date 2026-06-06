@@ -30,9 +30,15 @@ def resolve_image_url(path: str) -> str:
     """Convert a DB image path to a full URL."""
     if not path:
         return ""
+
+    path = path.strip()
+    if not path:
+        return ""
+
     if path.startswith("http://") or path.startswith("https://"):
         return path
-    clean = path.lstrip("/")
+
+    clean = re.sub(r"[\\/]+", "/", path).lstrip("/")
     if clean.startswith("uploads/"):
         return f"https://novxcloud.com/{clean}"
     if clean.startswith("img/"):
