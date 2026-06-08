@@ -418,7 +418,7 @@ body.theme-dark .app-header {
   font-weight: 700;
 }
 
-.hero-panel {
+/* .hero-panel {
   padding: var(--space-lg) 0 var(--space-xl);
 }
 
@@ -432,7 +432,24 @@ body.theme-dark .app-header {
   color: var(--muted);
   max-width: 44rem;
   margin: 0 auto;
+} */
+
+
+.hero-logo {
+  height: 120px;
+  width: auto;
+  display: block;
+  margin: 0 auto;
 }
+
+.hero-panel {
+  padding: 0.25rem 0;
+}
+
+.hero-logo {
+  height: 100px;
+}
+
 
 .search-wrapper {
   max-width: 860px;
