@@ -124,48 +124,60 @@
 <script type="module" src="{{ url_for('static', filename='js/theme-manager.js') }}"></script>
 
 <!-- ── Download Cart Widget ── -->
-<div id="cart-bubble" onclick="CartManager.toggle()" title="Download Cart">
+<!-- FAB bubble -->
+<button id="cart-bubble" onclick="CartManager.toggle()" title="Download Cart" aria-label="Open download cart">
   <i class="bi bi-download"></i>
-  <span class="cart-count" id="cart-count" style="display:none;">0</span>
-</div>
+  <span id="cart-count" style="display:none;">0</span>
+</button>
 
-<div id="download-cart" style="bottom: 5rem;">
+<!-- Cart panel -->
+<div id="download-cart" role="dialog" aria-label="Download Cart" aria-modal="false">
+
+  <!-- Header -->
   <div class="cart-header">
-    <span><i class="bi bi-download text-white fs-5"></i></span>
-    <div class="d-flex gap-2 align-items-center">
-      <button class="btn btn-sm btn-outline-light py-0" onclick="CartManager.clearAll()" title="Clear all">
-        <i class="bi bi-trash"></i>
-      </button>
-      <button class="btn btn-sm btn-outline-light py-0" onclick="CartManager.toggle()" title="Close">
-        <i class="bi bi-x-lg"></i>
-      </button>
+    <div class="cart-header-left">
+      <span class="cart-header-title">Download Cart</span>
+      <span class="cart-header-subtitle" id="cart-header-count">0 items selected</span>
     </div>
+    <button class="cart-header-close" onclick="CartManager.toggle()" aria-label="Close cart">
+      <i class="bi bi-x-lg"></i>
+    </button>
   </div>
-  <div class="cart-body" id="cart-items-list">
-    <p class="text-muted text-center small py-3">No items selected.</p>
-  </div>
-  <div class="cart-footer">
-    <div class="d-flex justify-content-between align-items-center mb-2">
-      <small class="text-muted"><span id="cart-total">0</span> image(s) selected</small>
-    </div>
-    <!-- Single item: one Download Image button -->
+
+  <!-- Items list -->
+  <div id="cart-items-list"></div>
+
+  <!-- Footer actions -->
+  <div class="cart-footer" id="cart-footer-actions" style="display:none;">
+
+    <!-- 1 item: Download single image (primary) -->
     <div id="cart-btn-single" style="display:none;">
-      <button class="btn btn-primary w-100" onclick="CartManager.downloadDirect()" disabled id="btn-dl-single">
-        <i class="bi bi-download me-1"></i>Download Image
+      <button class="cart-btn-primary" id="btn-dl-single"
+              onclick="CartManager.downloadDirect()" disabled>
+        <i class="bi bi-download"></i>Download Image
       </button>
     </div>
-    <!-- Multiple items: two options -->
+
+    <!-- 2+ items: ZIP (primary) + individually (secondary) + clear -->
     <div id="cart-btn-multi" style="display:none;">
-      <div class="d-grid gap-2">
-        <button class="btn btn-primary" onclick="CartManager.downloadZip()" id="btn-dl-zip">
-          <i class="bi bi-file-zip me-1"></i>Download as ZIP
+      <button class="cart-btn-primary" id="btn-dl-zip"
+              onclick="CartManager.downloadZip()">
+        <i class="bi bi-file-zip"></i>Download as ZIP
+      </button>
+      <div class="cart-footer-secondary">
+        <button class="cart-btn-secondary" id="btn-dl-individual"
+                onclick="CartManager.downloadImages()">
+          <i class="bi bi-images me-1"></i>Download individually
         </button>
-        <button class="btn btn-outline-primary" onclick="CartManager.downloadImages()" id="btn-dl-individual">
-          <i class="bi bi-images me-1"></i>Download Individually
+        <button class="cart-btn-secondary cart-btn-clear"
+                onclick="CartManager.clearAll()">
+          Clear all
         </button>
       </div>
     </div>
+
   </div>
+
 </div>
 
 <!-- ── Global Cart + Autocomplete JS ── -->
@@ -218,31 +230,35 @@ const CartManager = (() => {
   }
 
   function toggle() {
-    const cart   = document.getElementById("download-cart");
-    const bubble = document.getElementById("cart-bubble");
-    const isVisible = cart.classList.contains("visible");
-    cart.classList.toggle("visible", !isVisible);
-    // Keep bubble visible at all times so user can reopen cart
-    bubble.style.display = "flex";
+    const panel = document.getElementById("download-cart");
+    panel.classList.toggle("visible");
   }
 
   function refresh() {
-    const cart = load();
+    const cart  = load();
     const items = Object.values(cart);
     const count = items.length;
 
-    // Update bubble badge
+    // ── Bubble badge ──────────────────────────────────────────────────────
     const badge = document.getElementById("cart-count");
-    badge.textContent = count;
-    badge.style.display = count > 0 ? "flex" : "none";
+    if (badge) {
+      badge.textContent    = count;
+      badge.style.display  = count > 0 ? "flex" : "none";
+    }
 
-    // Update total label
-    document.getElementById("cart-total").textContent = count;
+    // ── Header subtitle ───────────────────────────────────────────────────
+    const subtitle = document.getElementById("cart-header-count");
+    if (subtitle) {
+      subtitle.textContent = count === 1 ? "1 item selected" : `${count} items selected`;
+    }
 
-    // Enable/disable download buttons based on count
-    const single = document.getElementById("cart-btn-single");
-    const multi  = document.getElementById("cart-btn-multi");
-    const btnS   = document.getElementById("btn-dl-single");
+    // ── Footer visibility ─────────────────────────────────────────────────
+    const footerEl = document.getElementById("cart-footer-actions");
+    const single   = document.getElementById("cart-btn-single");
+    const multi    = document.getElementById("cart-btn-multi");
+    const btnS     = document.getElementById("btn-dl-single");
+
+    if (footerEl) footerEl.style.display = count > 0 ? "" : "none";
 
     if (single && multi) {
       if (count === 0) {
@@ -258,27 +274,36 @@ const CartManager = (() => {
       }
     }
 
-    // Render cart items
+    // ── Items list ────────────────────────────────────────────────────────
     const list = document.getElementById("cart-items-list");
     if (!list) return;
 
     if (count === 0) {
-      list.innerHTML = '<p class="text-muted text-center small py-3">No items selected.</p>';
+      list.innerHTML = `
+        <div class="cart-empty-state">
+          <i class="bi bi-download"></i>
+          <p>
+            <strong>Download Cart</strong>
+            Select products from search results. Selected images will appear here for download.
+          </p>
+        </div>`;
       return;
     }
 
     list.innerHTML = items.map(item => `
       <div class="cart-item" id="cart-item-${item.id}">
-        <img src="${item.imgUrl || ''}"
-             onerror="this.src=''"
+        <img class="cart-item-thumb"
+             src="${item.imgUrl || ''}"
+             onerror="this.style.visibility='hidden'"
              alt="${escHtml(item.name)}" />
-        <span class="item-name" title="${escHtml(item.name)}">${escHtml(item.name)}</span>
-        <button class="btn btn-sm btn-link text-danger p-0 ms-auto"
-                onclick="CartManager.remove(${item.id})" title="Remove">
+        <span class="cart-item-name" title="${escHtml(item.name)}">${escHtml(item.name)}</span>
+        <button class="cart-item-remove"
+                onclick="CartManager.remove(${item.id})"
+                title="Remove"
+                aria-label="Remove ${escHtml(item.name)}">
           <i class="bi bi-x"></i>
         </button>
-      </div>
-    `).join("");
+      </div>`).join("");
 
     // Sync checkboxes on current page
     document.querySelectorAll(".product-select-cb").forEach(cb => {
