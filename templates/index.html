@@ -17,11 +17,13 @@
 
 <!-- ── Hero / Search bar ── -->
 <div class="hero-panel text-center mb-4 mt-2">
-  <h1 class="fw-bold mb-1">
-    <i class="bi bi-search text-primary me-2"></i>Product Search
-  </h1>
+  <div class="mb-3">
+    <img src="{{ url_for('static', filename='images/Scout.png') }}"
+         alt="Scout"
+         style="height:56px; width:auto; object-fit:contain;" />
+  </div>
   <p class="text-muted mb-4">
-    Typo-tolerant · Word-order independent · Partial keyword matching
+    Search product across multiple ERPs
   </p>
   {% if databases and databases|length > 1 %}
   <div class="d-flex justify-content-center mb-3">
@@ -85,10 +87,9 @@
   </div>
 
   <!--
-    Image preview panel — hidden by default.
-    Shown by JS when sessionStorage contains image data from a previous
-    image search.  Keeps the search bar clean (no query pollution).
+    Image preview panel — only rendered when an image search is active (img=1).
   -->
+  {% if request.args.get('img') == '1' %}
   <div id="img-preview-panel"
        class="align-items-center gap-3 p-3 rounded-3 mt-3"
        style="background: var(--surface-soft); border:1px solid var(--border);">
@@ -106,6 +107,14 @@
       <i class="bi bi-x me-1"></i>Clear
     </button>
   </div>
+  {% else %}
+  {# Hidden placeholders so JS refs don't break #}
+  <div id="img-preview-panel" style="display:none;">
+    <img id="img-preview-thumb" src="" alt="" />
+    <div class="img-preview-body"><strong id="img-detected-label"></strong></div>
+    <button type="button" id="btn-clear-image" style="display:none;"></button>
+  </div>
+  {% endif %}
 
   <!-- Stats pills -->
   <div class="stat-grid">

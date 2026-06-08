@@ -1,0 +1,111 @@
+- remove the default search by image section - only should come when the image got searched by the image
+- change the download button at the footer 
+- customize button should beplaced at the footer 
+- remove "
+FuzzySearch
+
+Modern SaaS search experience" form the navbar
+- removing this cards - Products indexed
+40940
+Ready to search
+Start typing…
+Database count
+2
+
+- also remove the  section of Type something above to start searching.
+- download cart has two icons at the footer area remove the text which says - Download cart and add a lue colored icon(Button) of dpwnload cart
+- the download cart button is not working 
+
+    /* ── Download Cart (floating) ── */
+    #download-cart {
+      position: fixed;
+      bottom: 1.5rem;
+      right: 1.5rem;
+      width: 320px;
+      z-index: 1050;
+      border-radius: .75rem;
+      box-shadow: 0 8px 32px rgba(0,0,0,.18);
+      display: none;
+      flex-direction: column;
+      max-height: 480px;
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      overflow: hidden;
+    }
+    #download-cart.visible { display: flex; }
+    #download-cart .cart-header {
+      background: #1e40af;
+      color: #fff;
+      padding: .65rem 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    #download-cart .cart-body {
+      overflow-y: auto;
+      flex: 1;
+      padding: .5rem;
+    }
+    #download-cart .cart-item {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      padding: .35rem .5rem;
+      border-radius: .375rem;
+      font-size: .8rem;
+    }
+    #download-cart .cart-item:hover { background: #f1f5f9; }
+    #download-cart .cart-item img {
+      width: 36px; height: 36px;
+      object-fit: contain;
+      border-radius: .25rem;
+      background: #f8fafc;
+      flex-shrink: 0;
+    }
+    #download-cart .cart-item .item-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #download-cart .cart-footer {
+      padding: .65rem;
+      border-top: 1px solid #e2e8f0;
+      flex-shrink: 0;
+    }
+
+    /* ── Cart toggle bubble ── */
+    #cart-bubble {
+      position: fixed;
+      bottom: 1.5rem;
+      right: 1.5rem;
+      width: 56px; height: 56px;
+      border-radius: 50%;
+      background: #2563eb;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.4rem;
+      cursor: pointer;
+      box-shadow: 0 4px 16px rgba(37,99,235,.4);
+      z-index: 1049;
+      transition: transform .15s ease;
+    }
+    #cart-bubble:hover { transform: scale(1.08); }
+    #cart-bubble .cart-count {
+      position: absolute;
+      top: -4px; right: -4px;
+      background: #dc2626;
+      color: #fff;
+      border-radius: 999px;
+      font-size: .65rem;
+      font-weight: 700;
+      min-width: 18px; height: 18px;
+      display: flex; align-items: center; justify-content: center;
+      padding: 0 4px;
+    }
+
+- remove the product search text as a main name and add a logo instead - path of the logo -  static\images\Scout_logo.png
+- remove Typo-tolerant · Word-order independent · Partial keyword matching instead write - serach product across multiple ERPs

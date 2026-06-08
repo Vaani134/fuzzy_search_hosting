@@ -21,22 +21,11 @@
 
 <header class="app-header">
   <div class="container-xl header-inner">
-    <a href="/" class="brand-box">
-      <span class="brand-mark">
-        <i class="bi bi-search"></i>
-      </span>
-      <div>
-        <p class="brand-title mb-0">FuzzySearch</p>
-        <p class="brand-subtitle mb-0">Modern SaaS search experience</p>
-      </div>
-    </a>
-<!-- 
-    <nav class="nav">
-      <a href="/search" class="nav-link {% if request.path == '/search' %}active{% endif %}">Search</a>
-      <a href="/analytics" class="nav-link {% if request.path == '/analytics' %}active{% endif %}">Analytics</a>
-      <a href="/sync" class="nav-link {% if request.path == '/sync' %}active{% endif %}">Sync</a>
-      <a href="/settings" class="nav-link {% if request.path == '/settings' %}active{% endif %}">Settings</a>
-    </nav> -->
+    <!-- <a href="/" class="brand-box">
+      <img src="{{ url_for('static', filename='images/Scout.png') }}"
+           alt="Scout Logo"
+           style="height:38px; width:auto; object-fit:contain;" />
+    </a> -->
 
     <div class="header-actions">
       <button type="button" class="btn btn-outline-primary btn-sm" id="theme-customizer-btn">
@@ -127,9 +116,9 @@
 </div>
 
 <!-- ── Footer ── -->
-<!-- <footer class="text-center py-3">
+<footer class="text-center py-3">
   Fuzzy Search Engine &mdash; RapidFuzz &bull; Flask &bull; SQLite
-</footer> -->
+</footer>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script type="module" src="{{ url_for('static', filename='js/theme-manager.js') }}"></script>
@@ -140,9 +129,9 @@
   <span class="cart-count" id="cart-count" style="display:none;">0</span>
 </div>
 
-<div id="download-cart">
+<div id="download-cart" style="bottom: 5rem;">
   <div class="cart-header">
-    <span><i class="bi bi-download me-2"></i>Download Cart</span>
+    <span><i class="bi bi-download text-white fs-5"></i></span>
     <div class="d-flex gap-2 align-items-center">
       <button class="btn btn-sm btn-outline-light py-0" onclick="CartManager.clearAll()" title="Clear all">
         <i class="bi bi-trash"></i>
@@ -229,11 +218,12 @@ const CartManager = (() => {
   }
 
   function toggle() {
-    const cart = document.getElementById("download-cart");
+    const cart   = document.getElementById("download-cart");
     const bubble = document.getElementById("cart-bubble");
     const isVisible = cart.classList.contains("visible");
     cart.classList.toggle("visible", !isVisible);
-    bubble.style.display = isVisible ? "flex" : "none";
+    // Keep bubble visible at all times so user can reopen cart
+    bubble.style.display = "flex";
   }
 
   function refresh() {
