@@ -13,296 +13,118 @@
   <link rel="stylesheet"
         href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" />
 
-  <style>
-    :root {
-      --brand-primary: #2563eb;
-      --brand-dark:    #1e40af;
-    }
-
-    body { background: #f8fafc; }
-
-    /* ── Navbar ── */
-    /* .navbar-brand {
-      font-weight: 700;
-      letter-spacing: -0.5px;
-      display: inline-flex;
-      align-items: center;
-    }
-    .navbar-logo {
-      max-width: 270px;
-      max-height: auto;
-      width: auto;
-      height: auto;
-      display: inline-block;
-    }
-    .navbar-brand-text {
-      display: none;
-      color: #fff;
-      font-size: 1rem;
-      font-weight: 700;
-      letter-spacing: -0.5px;
-    } */
-    @media (max-width: 768px) {
-      .navbar-logo {
-        max-width: 160px;
-      }
-    }
-    @media (max-width: 576px) {
-      .navbar-logo {
-        max-width: 140px;
-      }
-    }
-
-    /* ── Search bar ── */
-    .search-wrapper { max-width: 680px; margin: 0 auto; }
-    .search-input   { border-radius: 2rem 0 0 2rem !important; font-size: 1.1rem; padding: .65rem 1.2rem; }
-    .search-btn     { border-radius: 0 2rem 2rem 0 !important; padding: .65rem 1.4rem; }
-
-    /* ── Score badges ── */
-    .badge-high   { background: #16a34a; color: #fff; }
-    .badge-medium { background: #2563eb; color: #fff; }
-    .badge-low    { background: #d97706; color: #fff; }
-
-    /* ── Product card ── */
-    .product-card {
-      transition: box-shadow .15s ease, transform .15s ease;
-      border: 1px solid #e2e8f0;
-    }
-    .product-card:hover {
-      box-shadow: 0 8px 24px rgba(0,0,0,.10);
-      transform: translateY(-2px);
-    }
-    .product-img {
-      width: 100%;
-      height: 180px;
-      object-fit: contain;
-      background: #f1f5f9;
-      border-radius: .375rem .375rem 0 0;
-      padding: .5rem;
-    }
-    .product-img-placeholder {
-      width: 100%;
-      height: 180px;
-      background: #f1f5f9;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      border-radius: .375rem .375rem 0 0;
-      color: #94a3b8;
-      font-size: 3rem;
-    }
-
-    /* ── Score bar ── */
-    .score-bar-track {
-      height: 6px;
-      background: #e2e8f0;
-      border-radius: 3px;
-      overflow: hidden;
-    }
-    .score-bar-fill {
-      height: 100%;
-      border-radius: 3px;
-      transition: width .4s ease;
-    }
-    .score-bar-fill.high   { background: #16a34a; }
-    .score-bar-fill.medium { background: #2563eb; }
-    .score-bar-fill.low    { background: #d97706; }
-
-    /* ── Misc ── */
-    .stat-pill {
-      background: #e0e7ff;
-      color: #3730a3;
-      border-radius: 999px;
-      padding: .2rem .75rem;
-      font-size: .8rem;
-      font-weight: 600;
-    }
-    footer { font-size: .8rem; color: #94a3b8; }
-
-    /* ── Download Cart (floating) ── */
-    #download-cart {
-      position: fixed;
-      bottom: 1.5rem;
-      right: 1.5rem;
-      width: 320px;
-      z-index: 1050;
-      border-radius: .75rem;
-      box-shadow: 0 8px 32px rgba(0,0,0,.18);
-      display: none;
-      flex-direction: column;
-      max-height: 480px;
-      background: #fff;
-      border: 1px solid #e2e8f0;
-      overflow: hidden;
-    }
-    #download-cart.visible { display: flex; }
-    #download-cart .cart-header {
-      background: #1e40af;
-      color: #fff;
-      padding: .65rem 1rem;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-shrink: 0;
-    }
-    #download-cart .cart-body {
-      overflow-y: auto;
-      flex: 1;
-      padding: .5rem;
-    }
-    #download-cart .cart-item {
-      display: flex;
-      align-items: center;
-      gap: .5rem;
-      padding: .35rem .5rem;
-      border-radius: .375rem;
-      font-size: .8rem;
-    }
-    #download-cart .cart-item:hover { background: #f1f5f9; }
-    #download-cart .cart-item img {
-      width: 36px; height: 36px;
-      object-fit: contain;
-      border-radius: .25rem;
-      background: #f8fafc;
-      flex-shrink: 0;
-    }
-    #download-cart .cart-item .item-name {
-      flex: 1;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    #download-cart .cart-footer {
-      padding: .65rem;
-      border-top: 1px solid #e2e8f0;
-      flex-shrink: 0;
-    }
-
-    /* ── Cart toggle bubble ── */
-    #cart-bubble {
-      position: fixed;
-      bottom: 1.5rem;
-      right: 1.5rem;
-      width: 56px; height: 56px;
-      border-radius: 50%;
-      background: #2563eb;
-      color: #fff;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 1.4rem;
-      cursor: pointer;
-      box-shadow: 0 4px 16px rgba(37,99,235,.4);
-      z-index: 1049;
-      transition: transform .15s ease;
-    }
-    #cart-bubble:hover { transform: scale(1.08); }
-    #cart-bubble .cart-count {
-      position: absolute;
-      top: -4px; right: -4px;
-      background: #dc2626;
-      color: #fff;
-      border-radius: 999px;
-      font-size: .65rem;
-      font-weight: 700;
-      min-width: 18px; height: 18px;
-      display: flex; align-items: center; justify-content: center;
-      padding: 0 4px;
-    }
-
-    /* ── Card checkbox overlay ── */
-    .card-select-overlay {
-      position: absolute;
-      top: .5rem; left: .5rem;
-      z-index: 10;
-    }
-    .card-select-overlay input[type=checkbox] {
-      width: 20px; height: 20px;
-      cursor: pointer;
-      accent-color: #2563eb;
-    }
-    .product-card.selected {
-      outline: 2px solid #2563eb;
-      outline-offset: 2px;
-    }
-
-    /* ── Autocomplete dropdown ── */
-    #autocomplete-dropdown {
-      position: absolute;
-      top: 100%;
-      left: 0; right: 0;
-      background: #fff;
-      border: 1px solid #e2e8f0;
-      border-top: none;
-      border-radius: 0 0 .75rem .75rem;
-      box-shadow: 0 8px 24px rgba(0,0,0,.10);
-      z-index: 1000;
-      max-height: 320px;
-      overflow-y: auto;
-      display: none;
-    }
-    #autocomplete-dropdown.open { display: block; }
-    .ac-item {
-      padding: .5rem 1rem;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: .6rem;
-      font-size: .9rem;
-    }
-    .ac-item:hover, .ac-item.active { background: #eff6ff; }
-    .ac-item mark { background: #fef08a; padding: 0; border-radius: 2px; }
-    .ac-type-badge {
-      font-size: .65rem;
-      padding: .1rem .4rem;
-      border-radius: 999px;
-      flex-shrink: 0;
-    }
-    .ac-type-product  { background: #dbeafe; color: #1d4ed8; }
-    .ac-type-brand    { background: #fef9c3; color: #854d0e; }
-    .ac-type-category { background: #dcfce7; color: #166534; }
-  </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/theme.css') }}" />
 
   {% block extra_head %}{% endblock %}
 </head>
-<body>
+<body class="theme-light card-elevated density-comfortable">
 
-<!-- ── Navbar ── -->
-<!-- <nav class="navbar navbar-expand-lg navbar-dark" style="background: var(--brand-primary);">
-  <div class="container">
-    <a class="navbar-brand" href="/">
-      <img
-        src="{{ url_for('static', filename='images/Scout_logo.png') }}"
-        alt="Scout"
-        class="navbar-logo"
-        onerror="this.style.display='none'; this.nextElementSibling.style.display='inline';"
-      />
-      <span class="navbar-brand-text">FuzzySearch</span>
+<header class="app-header">
+  <div class="container-xl header-inner">
+    <a href="/" class="brand-box">
+      <span class="brand-mark">
+        <i class="bi bi-search"></i>
+      </span>
+      <div>
+        <p class="brand-title mb-0">FuzzySearch</p>
+        <p class="brand-subtitle mb-0">Modern SaaS search experience</p>
+      </div>
     </a>
-    <div class="d-flex gap-3 ms-auto">
-      <a href="/"         class="nav-link text-white {% if request.path == '/' %}fw-bold{% endif %}">
-        <i class="bi bi-speedometer2 me-1"></i>Dashboard
-      </a>
-      <a href="/search"   class="nav-link text-white {% if request.path == '/search' %}fw-bold{% endif %}">
-        <i class="bi bi-search me-1"></i>Search
-      </a>
-      <a href="/sync"     class="nav-link text-white {% if request.path == '/sync' %}fw-bold{% endif %}">
-        <i class="bi bi-arrow-repeat me-1"></i>Sync
-      </a>
-      <a href="/settings" class="nav-link text-white {% if request.path == '/settings' %}fw-bold{% endif %}">
-        <i class="bi bi-gear me-1"></i>Settings
-      </a>
-      <a href="/analytics" class="nav-link text-white" title="Top Searches">
-        <i class="bi bi-bar-chart me-1"></i>Analytics
-      </a>
+<!-- 
+    <nav class="nav">
+      <a href="/search" class="nav-link {% if request.path == '/search' %}active{% endif %}">Search</a>
+      <a href="/analytics" class="nav-link {% if request.path == '/analytics' %}active{% endif %}">Analytics</a>
+      <a href="/sync" class="nav-link {% if request.path == '/sync' %}active{% endif %}">Sync</a>
+      <a href="/settings" class="nav-link {% if request.path == '/settings' %}active{% endif %}">Settings</a>
+    </nav> -->
+
+    <div class="header-actions">
+      <button type="button" class="btn btn-outline-primary btn-sm" id="theme-customizer-btn">
+        <i class="bi bi-palette me-1"></i> Customize
+      </button>
+      <div class="dropdown">
+        <button class="btn btn-outline-secondary btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+          <i class="bi bi-gear"></i>
+        </button>
+        <ul class="dropdown-menu dropdown-menu-end">
+          <li><a class="dropdown-item" href="/settings">Workspace settings</a></li>
+          <li><a class="dropdown-item" href="/sync">Sync management</a></li>
+          <li><a class="dropdown-item" href="/analytics">Search analytics</a></li>
+        </ul>
+      </div>
     </div>
   </div>
-</nav> -->
+</header>
 
 <!-- ── Main content ── -->
-<main class="container py-4">
+<main class="container-xl py-5">
   {% block content %}{% endblock %}
 </main>
+
+<div id="theme-panel" class="theme-panel" aria-hidden="true">
+  <div class="theme-panel-backdrop" onclick="ThemeManager.closePanel()"></div>
+  <aside class="theme-panel-sheet" role="dialog" aria-modal="true" aria-labelledby="theme-panel-title">
+    <div class="theme-panel-header">
+      <div>
+        <p class="eyebrow">Appearance</p>
+        <h2 id="theme-panel-title">Theme customizer</h2>
+        <p class="text-muted small mb-0">Switch modes, accents, density, and card style in one place.</p>
+      </div>
+      <button type="button" class="btn btn-ghost" aria-label="Close theme customizer" onclick="ThemeManager.closePanel()">
+        <i class="bi bi-x-lg"></i>
+      </button>
+    </div>
+
+    <div class="theme-panel-body">
+      <section class="theme-section">
+        <h3>Theme mode</h3>
+        <div class="theme-grid">
+          <button type="button" class="theme-chip" data-theme-mode="light">Light</button>
+          <button type="button" class="theme-chip" data-theme-mode="dark">Dark</button>
+          <button type="button" class="theme-chip" data-theme-mode="system">System</button>
+        </div>
+      </section>
+
+      <section class="theme-section">
+        <h3>Accent color</h3>
+        <div class="theme-grid">
+          <button type="button" class="theme-swatch-button" data-theme-accent="#2563eb"><span style="background:#2563eb"></span><span class="theme-swatch-label">Blue</span></button>
+          <button type="button" class="theme-swatch-button" data-theme-accent="#7c3aed"><span style="background:#7c3aed"></span><span class="theme-swatch-label">Purple</span></button>
+          <button type="button" class="theme-swatch-button" data-theme-accent="#16a34a"><span style="background:#16a34a"></span><span class="theme-swatch-label">Green</span></button>
+          <button type="button" class="theme-swatch-button" data-theme-accent="#f97316"><span style="background:#f97316"></span><span class="theme-swatch-label">Orange</span></button>
+          <button type="button" class="theme-swatch-button" data-theme-accent="#ef4444"><span style="background:#ef4444"></span><span class="theme-swatch-label">Red</span></button>
+        </div>
+        <div class="theme-color-picker mt-3">
+          <label for="theme-custom-accent" class="mb-0">Custom color</label>
+          <input type="color" id="theme-custom-accent" value="#2563eb" aria-label="Custom accent color" />
+        </div>
+      </section>
+
+      <section class="theme-section">
+        <h3>Card style</h3>
+        <div class="theme-grid">
+          <button type="button" class="theme-chip" data-theme-card="flat">Flat</button>
+          <button type="button" class="theme-chip" data-theme-card="elevated">Elevated</button>
+          <button type="button" class="theme-chip" data-theme-card="glass">Glass</button>
+        </div>
+      </section>
+
+      <section class="theme-section">
+        <h3>Density</h3>
+        <div class="theme-grid">
+          <button type="button" class="theme-chip" data-theme-density="compact">Compact</button>
+          <button type="button" class="theme-chip" data-theme-density="comfortable">Comfortable</button>
+          <button type="button" class="theme-chip" data-theme-density="spacious">Spacious</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="theme-panel-footer mt-4">
+      <button type="button" class="btn btn-outline-secondary btn-sm" id="theme-reset-btn">Reset defaults</button>
+      <span class="text-muted small">Preferences are saved automatically.</span>
+    </div>
+  </aside>
+</div>
 
 <!-- ── Footer ── -->
 <!-- <footer class="text-center py-3">
@@ -310,6 +132,7 @@
 </footer> -->
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script type="module" src="{{ url_for('static', filename='js/theme-manager.js') }}"></script>
 
 <!-- ── Download Cart Widget ── -->
 <div id="cart-bubble" onclick="CartManager.toggle()" title="Download Cart">

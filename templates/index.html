@@ -2,144 +2,26 @@
 
 {% block title %}Fuzzy Product Search{% endblock %}
 
-{% block extra_head %}
-<style>
-  /* ── Filter panel ── */
-  .filter-panel {
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: .75rem;
-    padding: 1rem 1.25rem;
-    margin-bottom: 1.25rem;
-  }
-  .filter-panel .form-label { font-size: .8rem; font-weight: 600; color: #374151; margin-bottom: .2rem; }
-  .filter-panel .form-control,
-  .filter-panel .form-select { font-size: .875rem; }
-
-  /* ── Loading overlay ── */
-  #search-loading {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(255,255,255,.6);
-    z-index: 2000;
-    align-items: center;
-    justify-content: center;
-    flex-direction: column;
-    gap: .75rem;
-  }
-  #search-loading.active { display: flex; }
-  #search-loading .spinner-border { width: 3rem; height: 3rem; color: var(--brand-primary); }
-
-  /* ── Pagination ── */
-  .pagination .page-link { border-radius: .375rem !important; margin: 0 2px; }
-  .pagination .page-item.active .page-link { background: var(--brand-primary); border-color: var(--brand-primary); }
-
-  /* ── Camera button ── */
-  #btn-image-search {
-    border-left: none;
-    background: #fff;
-    border-color: #dee2e6;
-    color: #6b7280;
-    transition: color .15s, background .15s;
-  }
-  #btn-image-search:hover { color: var(--brand-primary); background: #eff6ff; }
-
-  /* ── Product detail modal ── */
-  #product-modal .modal-dialog {
-    max-width: 780px;
-  }
-  #product-modal .modal-product-img {
-    width: 100%;
-    max-height: 280px;
-    object-fit: contain;
-    background: #f8fafc;
-    border-radius: .5rem;
-    padding: .75rem;
-  }
-  #product-modal .modal-product-img-placeholder {
-    width: 100%;
-    height: 200px;
-    background: #f1f5f9;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: .5rem;
-    font-size: 4rem;
-    color: #94a3b8;
-  }
-  #product-modal .modal-spinner {
-    min-height: 200px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 1rem;
-    color: #6b7280;
-  }
-  #product-modal .modal-error {
-    min-height: 160px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: .75rem;
-    color: #dc2626;
-  }
-  /* Make product name / image links trigger modal */
-  .product-card .product-modal-trigger {
-    cursor: pointer;
-  }
-
-  /* ── Image search status (uploading / error) ── */
-  #img-search-status {
-    display: none;
-    font-size: .85rem;
-  }
-  #img-search-status.show { display: flex; }
-
-  /* ── Image preview panel (Google Lens style) ── */
-  #img-preview-panel {
-    display: none;
-    max-width: 680px;
-    margin: .75rem auto 0;
-  }
-  #img-preview-panel.show { display: flex; }
-  #img-preview-thumb {
-    width: 64px;
-    height: 64px;
-    object-fit: cover;
-    border-radius: .5rem;
-    border: 2px solid #bfdbfe;
-    flex-shrink: 0;
-  }
-  #img-preview-panel .img-preview-body {
-    flex: 1;
-    min-width: 0;
-    text-align: left;
-  }
-  #btn-clear-image {
-    flex-shrink: 0;
-    font-size: .8rem;
-  }
-</style>
-{% endblock %}
+{% block extra_head %}{% endblock %}
 
 {% block content %}
 
 <!-- ── Loading overlay ── -->
 <div id="search-loading">
-  <div class="spinner-border" role="status"></div>
-  <span class="text-muted fw-semibold">Searching…</span>
+  <div class="loading-card">
+    <div class="loading-title"></div>
+    <div class="loading-line"></div>
+    <div class="loading-line short"></div>
+  </div>
 </div>
 
 <!-- ── Hero / Search bar ── -->
-<div class="text-center mb-4 mt-2">
-  <h1 class="fw-bold mb-1" style="font-size:2rem;">
+<div class="hero-panel text-center mb-4 mt-2">
+  <h1 class="fw-bold mb-1">
     <i class="bi bi-search text-primary me-2"></i>Product Search
   </h1>
   <p class="text-muted mb-4">
-    Typo-tolerant &bull; Word-order independent &bull; Partial keyword matching
+    Typo-tolerant · Word-order independent · Partial keyword matching
   </p>
   {% if databases and databases|length > 1 %}
   <div class="d-flex justify-content-center mb-3">
@@ -209,7 +91,7 @@
   -->
   <div id="img-preview-panel"
        class="align-items-center gap-3 p-3 rounded-3 mt-3"
-       style="background:#eff6ff; border:1px solid #bfdbfe;">
+       style="background: var(--surface-soft); border:1px solid var(--border);">
     <img id="img-preview-thumb" src="" alt="Searched image" />
     <div class="img-preview-body">
       <div class="fw-semibold text-primary" style="font-size:.85rem;">
@@ -226,27 +108,29 @@
   </div>
 
   <!-- Stats pills -->
-  <div class="mt-3 d-flex justify-content-center gap-2 flex-wrap">
-    <span class="stat-pill">
-      <i class="bi bi-box-seam me-1"></i>{{ stats.total_products }} products indexed
-    </span>
-    {% if query %}
-    <span class="stat-pill">
-      <i class="bi bi-list-check me-1"></i>{{ total_results }} results
-    </span>
-    {% endif %}
+  <div class="stat-grid">
+    <div class="stat-card">
+      <span class="stat-label">Products indexed</span>
+      <span class="stat-value">{{ stats.total_products }}</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">{% if query %}Search results{% else %}Ready to search{% endif %}</span>
+      <span class="stat-value">{% if query %}{{ total_results }}{% else %}Start typing…{% endif %}</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Database count</span>
+      <span class="stat-value">{{ databases | length if databases else 1 }}</span>
+    </div>
   </div>
 
   <!-- ── "Did You Mean" banner — hidden for image searches ── -->
   {% if suggestion and suggestion | lower != query | lower and request.args.get('img') != '1' %}
   <div class="mt-3 d-flex justify-content-center">
-    <div class="d-inline-flex align-items-center gap-2 px-3 py-2 rounded-pill"
-         style="background:#eff6ff; border:1px solid #bfdbfe; font-size:.9rem;">
+    <div class="suggestion-banner d-inline-flex align-items-center gap-2 px-3 py-2 rounded-pill">
       <i class="bi bi-lightbulb text-primary"></i>
       <span class="text-muted">Did you mean</span>
       <a href="/search?db_id={{ db_id }}&q={{ suggestion | urlencode }}&limit={{ limit }}&sort={{ sort }}"
-         class="fw-semibold text-primary text-decoration-none"
-         style="border-bottom:1px dashed #2563eb;">
+         class="fw-semibold text-primary text-decoration-none suggestion-link">
         {{ suggestion }}
       </a>
       <span class="text-muted">?</span>
@@ -264,8 +148,17 @@
   <input type="hidden" name="page"  value="1" />
   <input type="hidden" name="limit" value="{{ limit }}" />
 
-  <div class="filter-panel">
-    <div class="row g-2 align-items-end">
+  <details class="filter-panel-details open">
+    <summary>
+      <div>
+        <p class="filter-panel-summary-title mb-0">Filters & sorting</p>
+        <p class="filter-panel-summary-meta mb-0">Refine results by category, price, and sort order.</p>
+      </div>
+      <span class="text-muted">Tap to collapse</span>
+    </summary>
+
+    <div class="filter-panel">
+      <div class="row g-2 align-items-end">
 
       <!-- Category filter -->
       <div class="col-12 col-sm-6 col-md-3">
@@ -325,15 +218,48 @@
       </div>
 
     </div>
+    </div>
+  </details>
+
+  {% if category or min_price or max_price or sort != 'score' %}
+  <div class="filter-chip-bar">
+    {% if category %}
+    <span class="filter-chip">Category: <strong>{{ category }}</strong>
+      <a href="/search?db_id={{ db_id }}&q={{ query | urlencode }}&limit={{ limit }}&sort={{ sort }}&min_price={{ min_price }}&max_price={{ max_price }}">
+        <i class="bi bi-x"></i>
+      </a>
+    </span>
+    {% endif %}
+    {% if min_price %}
+    <span class="filter-chip">Min: ${{ min_price }}
+      <a href="/search?db_id={{ db_id }}&q={{ query | urlencode }}&category={{ category | urlencode }}&limit={{ limit }}&sort={{ sort }}&max_price={{ max_price }}">
+        <i class="bi bi-x"></i>
+      </a>
+    </span>
+    {% endif %}
+    {% if max_price %}
+    <span class="filter-chip">Max: ${{ max_price }}
+      <a href="/search?db_id={{ db_id }}&q={{ query | urlencode }}&category={{ category | urlencode }}&limit={{ limit }}&sort={{ sort }}&min_price={{ min_price }}">
+        <i class="bi bi-x"></i>
+      </a>
+    </span>
+    {% endif %}
+    {% if sort != 'score' %}
+    <span class="filter-chip">Sort: {{ sort | title }}
+      <a href="/search?db_id={{ db_id }}&q={{ query | urlencode }}&category={{ category | urlencode }}&limit={{ limit }}&min_price={{ min_price }}&max_price={{ max_price }}">
+        <i class="bi bi-x"></i>
+      </a>
+    </span>
+    {% endif %}
   </div>
-</form>
+  {% endif %}
 {% endif %}
 
 <!-- ── No query state ── -->
-{% if not query %}
-<div class="text-center text-muted py-5">
-  <i class="bi bi-search" style="font-size:4rem; opacity:.2;"></i>
-  <p class="mt-3">Type something above to start searching.</p>
+<!-- {% if not query %}
+<div class="empty-state text-center py-5">
+  <i class="bi bi-search"></i>
+  <p class="mt-3 fs-5">Type something above to start searching.</p>
   <div class="mt-4 d-flex justify-content-center gap-2 flex-wrap">
     {% for hint in ["hookah", "grinder", "marlboro", "glass pipe", "energy drink"] %}
     <a href="/search?db_id={{ db_id }}&q={{ hint }}" class="btn btn-outline-secondary btn-sm rounded-pill">
@@ -341,16 +267,16 @@
     </a>
     {% endfor %}
   </div>
-</div>
+</div> -->
 
 <!-- ── No results ── -->
 {% elif results|length == 0 %}
-<div class="text-center text-muted py-5">
-  <i class="bi bi-emoji-frown" style="font-size:4rem; opacity:.2;"></i>
-  <p class="mt-3">No products matched <strong>"{{ query }}"</strong>.</p>
-  <p class="small">Try a shorter keyword, check the spelling, or remove filters.</p>
+<div class="empty-state text-center py-5">
+  <i class="bi bi-emoji-frown"></i>
+  <p class="mt-3 fs-5">No products matched <strong>"{{ query }}"</strong>.</p>
+  <p class="small text-muted">Try a shorter keyword, check the spelling, or remove filters.</p>
   {% if category or min_price or max_price %}
-  <a href="/search?db_id={{ db_id }}&q={{ query | urlencode }}" class="btn btn-outline-primary btn-sm mt-2">
+  <a href="/search?db_id={{ db_id }}&q={{ query | urlencode }}" class="btn btn-outline-primary btn-sm mt-3">
     <i class="bi bi-x-circle me-1"></i>Clear filters
   </a>
   {% endif %}
