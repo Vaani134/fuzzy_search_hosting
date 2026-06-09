@@ -91,18 +91,17 @@
   -->
   {% if request.args.get('img') == '1' %}
   <div id="img-preview-panel"
-       class="align-items-center gap-3 p-3 rounded-3 mt-3"
+       class="d-flex align-items-center gap-3 rounded-3 mt-3"
        style="background: var(--surface-soft); border:1px solid var(--border);">
     <img id="img-preview-thumb" src="" alt="Searched image" />
-    <div class="img-preview-body">
-      <div class="fw-semibold text-primary" style="font-size:.85rem;">
+    <div class="img-preview-body d-flex align-items-center gap-2 text-wrap">
+      <span class="fw-semibold text-primary" style="font-size:.85rem;">
         <i class="bi bi-camera-fill me-1"></i>Searching by image
-      </div>
-      <div class="text-muted mt-1" style="font-size:.8rem;">
-        Detected: <strong id="img-detected-label"></strong>
-      </div>
+      </span>
+      <span class="text-muted" style="font-size:.85rem;">—</span>
+      <strong id="img-detected-label" style="font-size:.85rem;" class="text-muted"></strong>
     </div>
-    <button type="button" class="btn btn-sm btn-outline-secondary btn-clear-image"
+    <button type="button" class="btn btn-sm btn-outline-secondary btn-clear-image ms-auto"
             id="btn-clear-image" title="Clear image search">
       <i class="bi bi-x me-1"></i>Clear
     </button>
