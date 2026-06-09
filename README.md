@@ -1,17 +1,48 @@
 # Fuzzy Search Hosting
 
-Production-grade multi-database fuzzy search platform built with Flask + SQLite + RapidFuzz.
+Production-grade fuzzy product search platform built with Flask, SQLite, RapidFuzz, and optional MySQL sync sources.
 
-**Key capabilities:**
+## What this app does
+- Searches product catalogs with fuzzy matching, ranking, filters, and autocomplete.
+- Syncs MySQL source databases into a local SQLite store for fast search and analytics.
+- Supports global search across all connected databases and isolated per-database search.
+- Includes image search, synonym management, cache stats, and sync monitoring pages.
+
+## Quick start
+1. Create and activate a Python environment.
+   ```bash
+   python -m venv .venv
+   .\.venv\Scripts\activate
+   ```
+2. Install dependencies.
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Set a secret key for Flask.
+   ```bash
+   set SECRET_KEY=replace-this-with-a-random-value
+   ```
+4. Start the app.
+   ```bash
+   python app.py
+   ```
+5. Open http://127.0.0.1:5000/ in your browser.
+
+## Key capabilities
 - MySQL → SQLite incremental sync with per-database isolation and crash-resume
 - Fuzzy search (RapidFuzz blend + composite ranking) per isolated DB or globally
-- Persistent engine disk cache — 80–95% faster cold starts
-- Query result cache (Redis / in-memory LRU) with hit/miss tracking
-- In-memory TTL autocomplete cache (30s, 500-entry LRU)
-- Incremental in-memory index updates — no full rebuild on small sync batches
+- Persistent engine disk cache for faster restarts
+- Query result cache (Redis or in-memory LRU) with hit/miss tracking
+- In-memory autocomplete cache with TTL and LRU eviction
+- Incremental in-memory index updates and compaction rebuilds
 - Per-source priority boosting in global search
-- Comprehensive metrics: P50/P95/P99 latency, cache hit rates, rebuild counters
-- Autocomplete, synonyms, image search, click/popularity ranking, analytics
+- Metrics for latency, cache hit rate, and rebuild performance
+- UI for search, sync, settings, analytics, and synonym suggestions
+
+## Deployment notes
+- The app is ready for Render with the included Procfile and render.yaml.
+- For production, set SECRET_KEY and any optional REDIS_URL / MYSQL_* values in the environment.
+- The main WSGI entry point is `app:app`, and the default local port is 5000.
 
 ---
 
@@ -23,22 +54,22 @@ Production-grade multi-database fuzzy search platform built with Flask + SQLite 
 │  ┌───────────┐   ┌──────────────┐   ┌───────────────────────────┐  │
 │  │ Search UI │   │ Synonym Mgmt │   │  Multi-DB Sync Control    │  │
 │  └─────┬─────┘   └──────────────┘   └──────────────┬────────────┘  │
-│        │                                             │               │
+│        │                                             │             │
 │  ┌─────▼─────────────────────────────────────────────▼───────────┐  │
-│  │              routes/search_routes.py  (API)                    │  │
-│  │  • latency tracking (time.perf_counter)                        │  │
-│  │  • query cache hit/miss → modules/metrics.py                   │  │
-│  │  • autocomplete latency → modules/metrics.py                   │  │
-│  └────────────────────────────┬───────────────────────────────────┘  │
-│                                │                                      │
+│  │              routes/search_routes.py  (API)                   │  │
+│  │  • latency tracking (time.perf_counter)                       │  │
+│  │  • query cache hit/miss → modules/metrics.py                  │  │
+│  │  • autocomplete latency → modules/metrics.py                  │  │
+│  └────────────────────────────┬──────────────────────────────────┘  │
+│                               │                                      │
 │  ┌─────────────────────────────▼────────────────────────────────┐    │
-│  │              modules/fuzzy_search.py                          │    │
-│  │                                                               │    │
+│  │              modules/fuzzy_search.py                         │    │
+│  │                                                              │    │
 │  │  get_engine(db_id)           get_global_engine()             │    │
-│  │       │                              │                        │    │
+│  │       │                              │                       │    │
 │  │  Isolated Engine              Global Engine                  │    │
 │  │  (one per source DB)       (all DBs merged; source priority) │    │
-│  │       │                              │                        │    │
+│  │       │                              │                       │    │
 │  │  ┌────▼──────────────────────────────▼──────┐                │    │
 │  │  │          Disk Cache Layer                 │                │    │
 │  │  │     modules/cache_manager.py              │                │    │
@@ -50,26 +81,26 @@ Production-grade multi-database fuzzy search platform built with Flask + SQLite 
 │  │  update_products_incremental(ids) — merge subset, no rebuild  │    │
 │  │  remove_products(ids)             — drop from in-memory index │    │
 │  └───────────────────────────────────────────────────────────────┘    │
-│                                                                        │
+│                                                                       │
 │  ┌────────────────────────────────────────────────────────────────┐   │
-│  │  modules/query result cache: modules/cache.py (Redis/memory)  │   │
+│  │  modules/query result cache: modules/cache.py (Redis/memory)   │   │
 │  └────────────────────────────────────────────────────────────────┘   │
-│                                                                        │
+│                                                                       │
 │  ┌────────────────────────────────────────────────────────────────┐   │
-│  │  modules/autocomplete.py — TTL cache (30s, 500-entry LRU)     │   │
+│  │  modules/autocomplete.py — TTL cache (30s, 500-entry LRU)      │   │
 │  └────────────────────────────────────────────────────────────────┘   │
-│                                                                        │
+│                                                                       │
 │  ┌────────────────────────────────────────────────────────────────┐   │
 │  │  modules/metrics.py — SearchMetrics singleton                  │   │
 │  │  • disk cache hits/misses  • query cache hits/misses           │   │
 │  │  • search latency P50/P95/P99  • autocomplete latency          │   │
 │  │  • rebuild count + duration percentiles                        │   │
 │  └────────────────────────────────────────────────────────────────┘   │
-│                                                                        │
+│                                                                       │
 │  ┌────────────────────────────────────────────────────────────────┐   │
-│  │  modules/sync_manager.py  ←  MySQL source DBs                 │   │
-│  │  (incremental sync, crash-resume, per-DB isolation)           │   │
-│  │  → rebuilds engines + clears query & autocomplete caches      │   │
+│  │  modules/sync_manager.py  ←  MySQL source DBs                  │   │
+│  │  (incremental sync, crash-resume, per-DB isolation)            │   │
+│  │  → rebuilds engines + clears query & autocomplete caches       │   │
 │  └────────────────────────────────────────────────────────────────┘   │
 └───────────────────────────────────────────────────────────────────────┘
                               │ SQLite  db/local.db
